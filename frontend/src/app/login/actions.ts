@@ -18,10 +18,11 @@ export async function signIn(formData: FormData) {
   const { error } = await supabase.auth.signInWithPassword({ email, password });
 
   if (error) {
-    // Mensagens do Supabase vêm em inglês — traduz as comuns.
     const msg =
       error.message === 'Invalid login credentials'
         ? 'Email ou senha incorretos'
+        : error.message === 'fetch failed' || error.message.includes('fetch')
+        ? 'Não foi possível conectar ao servidor. Tente novamente em instantes.'
         : error.message;
     redirect(`/login?error=${encodeURIComponent(msg)}`);
   }
