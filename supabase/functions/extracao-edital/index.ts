@@ -608,38 +608,73 @@ Deno.serve(async (req: Request) => {
     }
 
     // ---- 6) Persistir composições -------------------------------------------
-    const composicoesRows = parsed.itens.map((item, idx) => ({
-      licitacao_id: licitacaoId!,
-      extracao_id: extracaoId!,
-      item_codigo: item.item_codigo,
-      item_nivel: item.nivel,
-      item_pai_codigo: item.pai,
-      tipo_linha: item.tipo,
-      codigo: item.codigo,
-      fonte: item.fonte,
-      descricao: item.descricao,
-      unidade: item.unidade,
-      quantidade: item.quantidade,
-      preco_unitario_sem_bdi: item.preco_unitario_sem_bdi,
-      preco_unitario_com_bdi: item.preco_unitario_com_bdi,
-      preco_total: item.preco_total,
-      ordem: idx,
-      metadata: {},
-    }));
+    // PADRÃO DETECTADO (jul/2026): planilhas com múltiplos blocos/etapas às
+    // vezes reiniciam ou repetem a numeração (ex: "1.1" aparece em ETAPA 1 e
+    // ETAPA 2 do mesmo edital), e o Gemini ocasionalmente repete um
+    // item_codigo por erro de leitura de tabela complexa. Como
+    // composicoes_extraidas tem UNIQUE(licitacao_id, item_codigo), qualquer
+    // duplicata dentro do próprio lote derrubava o INSERT inteiro (todos os
+    // itens, não só o duplicado) e a extração inteira falhava.
+    // Fix: desambigua duplicatas dentro do lote adicionando um sufixo
+    // "#N" e guarda o código original em metadata pra auditoria/revisão.
+    const codigoSeen = new Map<string, number>();
+    const codigosDuplicados = new Set<string>();
+    for (const item of parsed.itens) {
+      const n = (codigoSeen.get(item.item_codigo) ?? 0) + 1;
+      codigoSeen.set(item.item_codigo, n);
+      if (n > 1) codigosDuplicados.add(item.item_codigo);
+    }
+    if (codigosDuplicados.size > 0) {
+      extracaoWarnings.push(
+        `item_codigo duplicado no lote extraído: ${[...codigosDuplicados].join(', ')}. ` +
+        `Duplicatas foram desambiguadas com sufixo "#N" (código original em metadata.item_codigo_original) — revise manualmente.`,
+      );
+    }
+    const codigoOcorrencia = new Map<string, number>();
+    const composicoesRows = parsed.itens.map((item, idx) => {
+      const ocorrencia = (codigoOcorrencia.get(item.item_codigo) ?? 0) + 1;
+      codigoOcorrencia.set(item.item_codigo, ocorrencia);
+      const itemCodigoFinal =
+        ocorrencia > 1 ? `${item.item_codigo}#${ocorrencia}` : item.item_codigo;
+      return {
+        licitacao_id: licitacaoId!,
+        extracao_id: extracaoId!,
+        item_codigo: itemCodigoFinal,
+        item_nivel: item.nivel,
+        item_pai_codigo: item.pai,
+        tipo_linha: item.tipo,
+        codigo: item.codigo,
+        fonte: item.fonte,
+        descricao: item.descricao,
+        unidade: item.unidade,
+        quantidade: item.quantidade,
+        preco_unitario_sem_bdi: item.preco_unitario_sem_bdi,
+        preco_unitario_com_bdi: item.preco_unitario_com_bdi,
+        preco_total: item.preco_total,
+        ordem: idx,
+        metadata: ocorrencia > 1 ? { item_codigo_original: item.item_codigo } : {},
+      };
+    });
 
     if (composicoesRows.length > 0) {
+      // upsert (não insert puro) como cinto-e-suspensório: se o auto-cleanup
+      // do passo 3.5 falhar silenciosamente (é "não fatal" por design),
+      // sobrescreve a linha antiga em vez de colidir com a mesma unique
+      // constraint (licitacao_id, item_codigo).
       const { error: cErr } = await admin
         .from('composicoes_extraidas')
-        .insert(composicoesRows);
+        .upsert(composicoesRows, { onConflict: 'licitacao_id,item_codigo' });
       if (cErr) {
         throw new Error(`Falha ao gravar composicoes_extraidas: ${cErr.message}`);
       }
     }
 
-    // Pega de volta os ids pra montar composicao_propria_itens (mantém ordem)
+    // Pega de volta os ids pra montar composicao_propria_itens (mantém ordem).
+    // Pareado por índice (ordem 0..n-1), não por item_codigo — códigos podem
+    // ter sido desambiguados acima e deixar de ser únicos por si só.
     const { data: composicoesPersistidas, error: cpErr } = await admin
       .from('composicoes_extraidas')
-      .select('id, item_codigo, fonte')
+      .select('id')
       .eq('licitacao_id', licitacaoId!)
       .eq('extracao_id', extracaoId!)
       .order('ordem');
@@ -647,14 +682,11 @@ Deno.serve(async (req: Request) => {
       throw new Error(`Falha ao reler composicoes_extraidas: ${cpErr.message}`);
     }
 
-    const idByCodigo = new Map(
-      (composicoesPersistidas ?? []).map((c) => [c.item_codigo, c.id]),
-    );
-
     const subItens: Array<Record<string, unknown>> = [];
-    for (const item of parsed.itens) {
+    for (let i = 0; i < parsed.itens.length; i++) {
+      const item = parsed.itens[i];
       if (item.fonte !== 'PROPRIA' || !item.composicao_propria?.itens) continue;
-      const compId = idByCodigo.get(item.item_codigo);
+      const compId = composicoesPersistidas?.[i]?.id;
       if (!compId) continue;
       item.composicao_propria.itens.forEach((sub, idx) => {
         subItens.push({
