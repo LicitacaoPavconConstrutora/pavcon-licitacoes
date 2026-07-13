@@ -29,6 +29,9 @@ export interface GeminiCallResult {
   usage: GeminiUsage;
   rawJson: unknown;
   estimatedCostUsd: number;
+  // "STOP" = terminou normal. "MAX_TOKENS" = cortado pelo teto de
+  // maxOutputTokens no meio da resposta — texto pode estar incompleto.
+  finishReason?: string;
 }
 
 export interface GeminiInlinePart {
@@ -44,6 +47,14 @@ export interface GeminiFilePart {
 }
 
 export type GeminiPart = GeminiInlinePart | GeminiTextPart | GeminiFilePart;
+
+// Um turno de conversa multi-turn (usado pra continuação de respostas
+// cortadas por MAX_TOKENS — reenvia a resposta anterior do model como
+// contexto em vez de reenviar os PDFs originais).
+export interface GeminiTurn {
+  role: 'user' | 'model';
+  parts: GeminiPart[];
+}
 
 // ---------------------------------------------------------------------------
 // Gemini Files API — upload raw bytes (sem base64) e referencia via file_uri.
@@ -156,6 +167,10 @@ interface CallGeminiOpts {
   model: string;            // ex.: "gemini-2.5-pro"
   apiKey: string;
   parts: GeminiPart[];
+  // Turnos anteriores da conversa (opcional) — prepostos antes de `parts`
+  // como o turno 'user' final. Usado pra continuação multi-rodada sem
+  // precisar reenviar PDFs grandes a cada chamada.
+  priorTurns?: GeminiTurn[];
   responseJson?: boolean;   // exige application/json (default: true)
   temperature?: number;     // default: 0.1 (extração estruturada)
   maxOutputTokens?: number; // default: 32768
@@ -177,7 +192,10 @@ export async function callGemini(
   const startedAt = Date.now();
 
   const body = {
-    contents: [{ parts: opts.parts }],
+    contents: [
+      ...(opts.priorTurns ?? []).map((t) => ({ role: t.role, parts: t.parts })),
+      { role: 'user', parts: opts.parts },
+    ],
     generationConfig: {
       temperature: opts.temperature ?? 0.1,
       maxOutputTokens: opts.maxOutputTokens ?? 32768,
@@ -275,5 +293,6 @@ export async function callGemini(
     usage,
     rawJson: parsed,
     estimatedCostUsd: estimateGeminiCost(usage),
+    finishReason,
   };
 }

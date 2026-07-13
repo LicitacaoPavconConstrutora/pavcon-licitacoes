@@ -376,6 +376,21 @@ export default async function LicitacaoDetailPage({
           </section>
         )}
 
+        {/* Extração terminou com status != 'erro' (chegou a 'sucesso') mas ainda
+            assim deixou avisos de recuperação (JSON truncado por limite de
+            tokens, item_codigo duplicado, campo obrigatório ausente, etc).
+            Sem isso o orçamentista via uma planilha incompleta sem nenhum
+            sinal — o erro_detalhe existia no banco mas nunca era exibido. */}
+        {licitacao.status !== 'erro' && ultimaExtracao?.erro_detalhe && (
+          <section className="rounded-lg border border-amber-300 bg-amber-50 p-6">
+            <h2 className="text-sm font-semibold text-amber-900">⚠ Avisos da extração</h2>
+            <p className="mt-2 whitespace-pre-wrap text-sm text-amber-800">{ultimaExtracao.erro_detalhe}</p>
+            <p className="mt-2 text-xs text-amber-700">
+              A extração foi concluída, mas revise os itens abaixo com atenção antes de cadastrar no Orçafascio.
+            </p>
+          </section>
+        )}
+
         <section className="rounded-lg border border-zinc-200 bg-white p-6 text-xs text-zinc-500">
           <h2 className="mb-2 text-sm font-semibold text-zinc-900">Custos da extração</h2>
           {ultimaExtracao?.custo_usd != null ? (
