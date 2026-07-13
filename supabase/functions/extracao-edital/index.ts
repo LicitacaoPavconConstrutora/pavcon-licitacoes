@@ -607,6 +607,43 @@ Deno.serve(async (req: Request) => {
       throw new Error(`JSON do Gemini inválido: ${msg}. Início: ${result.text?.slice(0, 200)}`);
     }
 
+    // ---- 5.6) Sanitiza campos obrigatórios ----------------------------------
+    // validateExtractedJson só checa o formato geral (cabecalho + itens[]),
+    // não os campos de cada item. Colunas NOT NULL/CHECK do schema
+    // (item_codigo, item_nivel, tipo_linha, descricao) não eram validadas em
+    // runtime — quando o Gemini deixava um desses campos null/vazio (célula
+    // mesclada ou mal-lida na planilha), o INSERT em lote falhava com
+    // "null value in column ... violates not-null constraint" e derrubava a
+    // extração inteira por causa de 1 item malformado. Fix: preenche com
+    // placeholder + avisa, em vez de abortar tudo.
+    let itensCorrigidos = 0;
+    parsed.itens.forEach((item, idx) => {
+      let corrigido = false;
+      if (!item.item_codigo || !String(item.item_codigo).trim()) {
+        item.item_codigo = `SEM_CODIGO_${idx + 1}`;
+        corrigido = true;
+      }
+      if (typeof item.nivel !== 'number' || !Number.isFinite(item.nivel)) {
+        item.nivel = 1;
+        corrigido = true;
+      }
+      if (item.tipo !== 'grupo' && item.tipo !== 'servico') {
+        item.tipo = 'servico';
+        corrigido = true;
+      }
+      if (!item.descricao || !item.descricao.trim()) {
+        item.descricao = `(descrição não extraída — item ${item.item_codigo})`;
+        corrigido = true;
+      }
+      if (corrigido) itensCorrigidos++;
+    });
+    if (itensCorrigidos > 0) {
+      extracaoWarnings.push(
+        `${itensCorrigidos} item(ns) com campo obrigatório ausente/inválido no JSON extraído — ` +
+        `preenchidos com placeholder. Revise manualmente antes de cadastrar no Orçafascio.`,
+      );
+    }
+
     // ---- 6) Persistir composições -------------------------------------------
     // PADRÃO DETECTADO (jul/2026): planilhas com múltiplos blocos/etapas às
     // vezes reiniciam ou repetem a numeração (ex: "1.1" aparece em ETAPA 1 e
