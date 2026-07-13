@@ -259,10 +259,22 @@ export async function saveExtractionEdits(
     .eq('extracao_id', extracaoId);
   if (delErr) return { error: `Falha ao limpar composições antigas: ${delErr.message}` };
 
+  // Mesmo padrão do extracao-edital (Edge Function) e importarJsonManual:
+  // item_codigo duplicado no JSON editado (blocos/etapas que repetem
+  // numeração, ou edição manual do orçamentista introduzindo um código já
+  // usado) colide com UNIQUE(licitacao_id, item_codigo) e derruba o
+  // INSERT inteiro. Desambigua com sufixo "#N" antes de gravar.
+  const codigoVistoEdicao = new Map<string, number>();
   const composicoesRows = jsonCorrigido.itens.map((item, idx) => {
     const fonteNormalizada = normalizeFonte(item.fonte);
     const adaptCheck = detectarCodigoAdaptado(fonteNormalizada, item.codigo);
     const fonteFinal = adaptCheck.reclassificarComoPropria ? 'PROPRIA' : fonteNormalizada;
+
+    const ocorrencia = (codigoVistoEdicao.get(item.item_codigo) ?? 0) + 1;
+    codigoVistoEdicao.set(item.item_codigo, ocorrencia);
+    const itemCodigoFinal =
+      ocorrencia > 1 ? `${item.item_codigo}#${ocorrencia}` : item.item_codigo;
+
     let metadata: Record<string, unknown> = {};
     if (item.fonte && fonteNormalizada === 'OUTRA' && item.fonte.toUpperCase() !== 'OUTRA') {
       metadata = { fonte_original: item.fonte };
@@ -275,10 +287,13 @@ export async function saveExtractionEdits(
         reclassificada_motivo: adaptCheck.motivo,
       };
     }
+    if (ocorrencia > 1) {
+      metadata = { ...metadata, item_codigo_original: item.item_codigo };
+    }
     return {
       licitacao_id: licitacaoId,
       extracao_id: extracaoId,
-      item_codigo: item.item_codigo,
+      item_codigo: itemCodigoFinal,
       item_nivel: item.nivel,
       item_pai_codigo: item.pai,
       tipo_linha: item.tipo,
@@ -296,27 +311,33 @@ export async function saveExtractionEdits(
   });
 
   if (composicoesRows.length > 0) {
+    // upsert (não insert puro): protege contra sobra de linhas de outro
+    // extracao_id pra mesma licitação, que o DELETE acima (escopado por
+    // extracao_id) não alcança.
     const { error: insErr } = await admin
       .from('composicoes_extraidas')
-      .insert(composicoesRows);
+      .upsert(composicoesRows, { onConflict: 'licitacao_id,item_codigo' });
     if (insErr) return { error: `Falha ao reinserir composições: ${insErr.message}` };
   }
 
-  // 3) Re-insere os sub-itens das composições próprias
+  // 3) Re-insere os sub-itens das composições próprias.
+  // Pareado por índice (ordem 0..n-1), não por item_codigo — códigos podem
+  // ter sido desambiguados acima e deixar de ser únicos por si só.
   const { data: persistidas, error: relerErr } = await admin
     .from('composicoes_extraidas')
-    .select('id, item_codigo')
+    .select('id')
     .eq('licitacao_id', licitacaoId)
-    .eq('extracao_id', extracaoId);
+    .eq('extracao_id', extracaoId)
+    .order('ordem');
   if (relerErr || !persistidas) {
     return { error: 'Falha ao reler composições.' };
   }
-  const idByCodigo = new Map(persistidas.map((c) => [c.item_codigo, c.id]));
 
   const subRows: Array<Record<string, unknown>> = [];
-  for (const item of jsonCorrigido.itens) {
+  for (let itemIdx = 0; itemIdx < jsonCorrigido.itens.length; itemIdx++) {
+    const item = jsonCorrigido.itens[itemIdx];
     if (item.fonte !== 'PROPRIA' || !item.composicao_propria?.itens) continue;
-    const compId = idByCodigo.get(item.item_codigo);
+    const compId = persistidas[itemIdx]?.id as string | undefined;
     if (!compId) continue;
     item.composicao_propria.itens.forEach((sub, i) => {
       subRows.push({
@@ -730,11 +751,35 @@ export async function importarExtracaoManual(
   // pra criar uma composição própria no MyBase em vez de tentar resolver
   // um code inexistente que zera o preço.
   let reclassificadas = 0;
+
+  // Mesmo padrão do extracao-edital (Edge Function): planilhas com múltiplos
+  // blocos/etapas às vezes repetem item_codigo entre blocos, e o LLM usado
+  // pra gerar o JSON manual (NotebookLM/Claude) também pode repetir um
+  // código por erro de leitura. Como composicoes_extraidas tem
+  // UNIQUE(licitacao_id, item_codigo), duplicata dentro do lote derrubava o
+  // INSERT inteiro. Desambigua com sufixo "#N" antes de gravar.
+  const codigoOcorrenciaManual = new Map<string, number>();
+  const codigosDuplicadosManual = new Set<string>();
+  for (const item of parsed.itens) {
+    const n = (codigoOcorrenciaManual.get(item.item_codigo) ?? 0) + 1;
+    codigoOcorrenciaManual.set(item.item_codigo, n);
+    if (n > 1) codigosDuplicadosManual.add(item.item_codigo);
+  }
+  if (codigosDuplicadosManual.size > 0) {
+    console.log(`[importar] item_codigo duplicado no JSON manual, desambiguado: ${[...codigosDuplicadosManual].join(', ')}`);
+  }
+
+  const codigoVistoManual = new Map<string, number>();
   const compRows = parsed.itens.map((item, idx) => {
     const fonteNormalizada = normalizeFonte(item.fonte);
     const adaptCheck = detectarCodigoAdaptado(fonteNormalizada, item.codigo);
     const fonteFinal = adaptCheck.reclassificarComoPropria ? 'PROPRIA' : fonteNormalizada;
     if (adaptCheck.reclassificarComoPropria) reclassificadas++;
+
+    const ocorrencia = (codigoVistoManual.get(item.item_codigo) ?? 0) + 1;
+    codigoVistoManual.set(item.item_codigo, ocorrencia);
+    const itemCodigoFinal =
+      ocorrencia > 1 ? `${item.item_codigo}#${ocorrencia}` : item.item_codigo;
 
     // Metadata: rastreabilidade pra fonte original quando reclassificamos
     let metadata: Record<string, unknown> = {};
@@ -749,11 +794,14 @@ export async function importarExtracaoManual(
         reclassificada_motivo: adaptCheck.motivo,
       };
     }
+    if (ocorrencia > 1) {
+      metadata = { ...metadata, item_codigo_original: item.item_codigo };
+    }
 
     return {
       licitacao_id: licitacaoId,
       extracao_id: extracaoId,
-      item_codigo: item.item_codigo,
+      item_codigo: itemCodigoFinal,
       item_nivel: item.nivel,
       item_pai_codigo: item.pai,
       tipo_linha: item.tipo,
@@ -772,15 +820,28 @@ export async function importarExtracaoManual(
   if (reclassificadas > 0) {
     console.log(`[importar] ${reclassificadas} items reclassificados de SINAPI/ORSE pra PROPRIA por sufixo de adaptação`);
   }
-  const { data: persistidas, error: cErr } = await admin
+  // upsert (não insert puro): se a limpeza acima (delete composicoes_extraidas)
+  // não pegar tudo por algum motivo, sobrescreve em vez de colidir com a
+  // mesma unique constraint (licitacao_id, item_codigo).
+  const { error: cErr } = await admin
     .from('composicoes_extraidas')
-    .insert(compRows)
-    .select('id, item_codigo');
-  if (cErr || !persistidas) {
+    .upsert(compRows, { onConflict: 'licitacao_id,item_codigo' });
+  if (cErr) {
     console.error('[importar] composicoes_extraidas insert FAILED', cErr);
-    return { error: `Falha ao gravar composicoes_extraidas: ${cErr?.message}` };
+    return { error: `Falha ao gravar composicoes_extraidas: ${cErr.message}` };
   }
-  const idByCodigo = new Map(persistidas.map((c) => [c.item_codigo as string, c.id as string]));
+  // Pareado por índice (ordem 0..n-1), não por item_codigo — códigos podem
+  // ter sido desambiguados acima e deixar de ser únicos por si só.
+  const { data: persistidas, error: persistErr } = await admin
+    .from('composicoes_extraidas')
+    .select('id')
+    .eq('licitacao_id', licitacaoId)
+    .eq('extracao_id', extracaoId)
+    .order('ordem');
+  if (persistErr || !persistidas) {
+    console.error('[importar] releitura composicoes_extraidas FAILED', persistErr);
+    return { error: `Falha ao reler composicoes_extraidas: ${persistErr?.message}` };
+  }
   console.log('[importar] composicoes inseridas', {
     ms: Date.now() - t0,
     count: persistidas.length,
@@ -788,9 +849,10 @@ export async function importarExtracaoManual(
 
   // Insere composicao_propria_itens
   const subRows: Array<Record<string, unknown>> = [];
-  for (const item of parsed.itens) {
+  for (let itemIdx = 0; itemIdx < parsed.itens.length; itemIdx++) {
+    const item = parsed.itens[itemIdx];
     if (item.fonte !== 'PROPRIA' || !item.composicao_propria?.itens) continue;
-    const compId = idByCodigo.get(item.item_codigo);
+    const compId = persistidas[itemIdx]?.id as string | undefined;
     if (!compId) continue;
     item.composicao_propria.itens.forEach((sub, i) => {
       subRows.push({
