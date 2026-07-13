@@ -29,7 +29,7 @@ import {
 // Edge Function usa Gemini 2.5 Pro como padrão (key cadastrada + cota free razoável).
 // Pra trocar pra Claude (Opus), basta cadastrar credencial Anthropic e mudar
 // LLM_PROVIDER abaixo pra 'anthropic' + importar de '../_shared/anthropic.ts'.
-import { callGemini, GeminiError } from '../_shared/gemini.ts';
+import { callGemini, GeminiError, type GeminiPart, type GeminiTurn } from '../_shared/gemini.ts';
 import { callClaude, type ClaudeContent } from '../_shared/anthropic.ts';
 import { PROMPT_VERSION, SYSTEM_PROMPT } from './prompt.ts';
 
@@ -47,6 +47,23 @@ const GEMINI_MODEL = 'gemini-2.5-pro';
 const CLAUDE_MODEL = 'claude-sonnet-4-5-20250929';
 const LLM_PROVIDER = 'gemini';
 const VALID_START_STATUSES = new Set(['rascunho', 'aguardando_extracao']);
+
+// PADRÃO DETECTADO (jul/2026): orçamentos grandes (planilhas com 100+ itens,
+// ex. numeração até "17.x") estouravam o teto de maxOutputTokens (default
+// 32768 do client Gemini) — a resposta cortava no meio (finishReason=
+// MAX_TOKENS) e a camada de recuperação "truncate-to-last-valid" salvava
+// só os itens até o corte, SEM marcar a extração como falha (o
+// orçamentista via "sucesso" com uma planilha incompleta).
+// Fix: (1) sobe o teto pro máximo real do gemini-2.5-pro; (2) se AINDA
+// assim cortar, faz até MAX_CONTINUACOES chamadas extras pedindo pro
+// Gemini continuar de onde parou (reaproveitando a resposta anterior como
+// contexto multi-turn, sem reenviar os PDFs).
+const GEMINI_MAX_OUTPUT_TOKENS = 65536;
+const MAX_CONTINUACOES = 3;
+// EdgeRuntime.waitUntil mantém a function viva por ~400s. Cada chamada ao
+// Gemini leva 120-180s — não vale iniciar mais uma rodada se já estamos
+// perto do teto, senão o processo morre no meio sem gravar nada.
+const TEMPO_LIMITE_CONTINUACAO_MS = 260_000;
 
 interface RequestBody {
   // Modo legado (1 arquivo). Continua suportado.
@@ -345,6 +362,9 @@ Deno.serve(async (req: Request) => {
       try {
     // ---- 4) Baixa TODOS PDFs + chama Gemini --------------------------------
     const startedAt = Date.now();
+    // Declarado aqui (não só na seção 5) pq o branch do Gemini já produz
+    // warnings de continuação/truncamento antes de chegar no parse final.
+    const extracaoWarnings: string[] = [];
 
     const tipoLabel: Record<string, string> = {
       planilha_orcamentaria: 'Planilha orçamentária (principal)',
@@ -476,30 +496,98 @@ Deno.serve(async (req: Request) => {
       resultCustoUsd = r.estimatedCostUsd;
     } else {
       // Gemini: parts levam system prompt + intro + PDFs como inlineData.
-      const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
-        { text: SYSTEM_PROMPT },
-      ];
-      if (introMultiArquivo) parts.push({ text: introMultiArquivo });
+      const initialParts: GeminiPart[] = [{ text: SYSTEM_PROMPT }];
+      if (introMultiArquivo) initialParts.push({ text: introMultiArquivo });
       for (const pdf of pdfsBase64) {
-        parts.push({ inlineData: { mimeType: 'application/pdf', data: pdf.b64 } });
+        initialParts.push({ inlineData: { mimeType: 'application/pdf', data: pdf.b64 } });
       }
-      const r = await callGemini({
-        model: GEMINI_MODEL,
-        apiKey,
-        parts,
-        responseJson: true,
-        temperature: 0.1,
-        admin,
-        callerUserId: user.id,
-        licitacaoId,
-        traceId,
-      });
-      resultText = r.text;
-      resultUsage = {
-        promptTokenCount: r.usage.promptTokenCount ?? 0,
-        candidatesTokenCount: r.usage.candidatesTokenCount ?? 0,
-      };
-      resultCustoUsd = r.estimatedCostUsd;
+
+      function buildContinuationParts(ultimoItem: ExtractedItem | undefined): GeminiPart[] {
+        return [{
+          text:
+            `Sua resposta anterior foi cortada por limite de tokens (finishReason=MAX_TOKENS) ` +
+            `antes de terminar a planilha orçamentária. O último item que você conseguiu extrair ` +
+            `foi "${ultimoItem?.item_codigo ?? '(desconhecido)'}" — "${ultimoItem?.descricao ?? ''}". ` +
+            `CONTINUE a extração a partir do PRÓXIMO item da planilha, na mesma ordem em que aparece ` +
+            `no PDF. NÃO repita "${ultimoItem?.item_codigo ?? ''}" nem nenhum item anterior. Responda ` +
+            `APENAS com um JSON no formato {"itens": [...]} contendo SOMENTE os itens restantes, no ` +
+            `mesmo schema de item já definido (sem a chave "cabecalho"). Comece com \`{\` e termine com \`}\`.`,
+        }];
+      }
+
+      let cabecalhoAcumulado: Record<string, unknown> | null = null;
+      const itensAcumulados: ExtractedItem[] = [];
+      const usageAcumulado = { promptTokenCount: 0, candidatesTokenCount: 0 };
+      let custoAcumulado = 0;
+      let conversationSoFar: GeminiTurn[] = [];
+      let rodada = 0;
+      let finishReason: string | undefined;
+
+      while (true) {
+        rodada++;
+        const requestParts = rodada === 1
+          ? initialParts
+          : buildContinuationParts(itensAcumulados[itensAcumulados.length - 1]);
+
+        const r = await callGemini({
+          model: GEMINI_MODEL,
+          apiKey,
+          parts: requestParts,
+          priorTurns: conversationSoFar,
+          responseJson: true,
+          temperature: 0.1,
+          maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
+          admin,
+          callerUserId: user.id,
+          licitacaoId,
+          traceId,
+        });
+        usageAcumulado.promptTokenCount += r.usage.promptTokenCount ?? 0;
+        usageAcumulado.candidatesTokenCount += r.usage.candidatesTokenCount ?? 0;
+        custoAcumulado += r.estimatedCostUsd;
+        finishReason = r.finishReason;
+
+        const textoResposta = r.text ?? '';
+        const { obj, warnings } = await tentarParse(textoResposta);
+        extracaoWarnings.push(...warnings);
+        const chunk = obj as { cabecalho?: unknown; itens?: unknown };
+        if (rodada === 1) {
+          if (!chunk.cabecalho || typeof chunk.cabecalho !== 'object') {
+            throw new Error('Faltou "cabecalho" no JSON.');
+          }
+          cabecalhoAcumulado = chunk.cabecalho as Record<string, unknown>;
+        }
+        if (!Array.isArray(chunk.itens)) {
+          throw new Error(`Faltou "itens" (array) no JSON (rodada ${rodada}).`);
+        }
+        itensAcumulados.push(...(chunk.itens as ExtractedItem[]));
+
+        conversationSoFar = [
+          ...conversationSoFar,
+          { role: 'user', parts: requestParts },
+          { role: 'model', parts: [{ text: textoResposta }] },
+        ];
+
+        const tempoDecorrido = Date.now() - startedAt;
+        const podeContinuar =
+          finishReason === 'MAX_TOKENS' &&
+          rodada < MAX_CONTINUACOES &&
+          tempoDecorrido < TEMPO_LIMITE_CONTINUACAO_MS;
+        if (!podeContinuar) {
+          if (finishReason === 'MAX_TOKENS') {
+            extracaoWarnings.push(
+              `Extração ainda cortada por limite de tokens após ${rodada} chamada(s) ao Gemini ` +
+              `(${itensAcumulados.length} itens obtidos até aqui). Planilha muito grande pro pipeline ` +
+              `atual — confira se faltam itens no fim da lista e reextraia se precisar.`,
+            );
+          }
+          break;
+        }
+      }
+
+      resultText = JSON.stringify({ cabecalho: cabecalhoAcumulado, itens: itensAcumulados });
+      resultUsage = usageAcumulado;
+      resultCustoUsd = custoAcumulado;
     }
     // Resto do código espera result.text/usage/estimatedCostUsd —
     // mantém compatibilidade com o UPDATE de extracoes_ocr abaixo.
@@ -597,7 +685,6 @@ Deno.serve(async (req: Request) => {
     }
 
     let parsed: ExtractedJson;
-    const extracaoWarnings: string[] = [];
     try {
       const { obj, warnings } = await tentarParse(result.text!);
       extracaoWarnings.push(...warnings);
