@@ -639,6 +639,7 @@ export function ExtractionPanel({
           extracaoId={ultimaExtracao.id}
           jsonInicial={ultimaExtracao.json}
           jaRevisada={ultimaExtracao.ja_revisada}
+          onApproved={handleCadastrarOrcamentoCompleto}
         />
       )}
 

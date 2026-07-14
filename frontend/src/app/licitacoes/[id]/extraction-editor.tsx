@@ -18,6 +18,12 @@ interface Props {
   extracaoId: string;
   jsonInicial: ExtractedJson;
   jaRevisada: boolean;
+  /** Chamado logo após "Aprovar e seguir" transicionar o status com sucesso —
+   * dispara automaticamente o cadastro completo no Orçafascio (Passo 1+2),
+   * já que o clique em "Aprovar" já é o momento em que o orçamentista
+   * confirma que revisou os dados; o cadastro em si é só a etapa mecânica
+   * seguinte. */
+  onApproved?: () => void;
 }
 
 export function ExtractionEditor({
@@ -25,6 +31,7 @@ export function ExtractionEditor({
   extracaoId,
   jsonInicial,
   jaRevisada,
+  onApproved,
 }: Props) {
   const [json, setJson] = useState<ExtractedJson>(() => structuredClone(jsonInicial));
   const [editMode, setEditMode] = useState(false);
@@ -82,7 +89,11 @@ export function ExtractionEditor({
         }
       }
       const r = await approveExtraction(licitacaoId);
-      if (r?.error) setActionError(r.error);
+      if (r?.error) {
+        setActionError(r.error);
+        return;
+      }
+      onApproved?.();
     });
   }
 
@@ -123,9 +134,10 @@ export function ExtractionEditor({
           <button
             onClick={handleApprove}
             disabled={isPending}
+            title="Aprova a extração e já dispara o cadastro completo no Orçafascio (Passo 1+2), sem precisar clicar de novo"
             className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
           >
-            {isPending ? '…' : 'Aprovar e seguir'}
+            {isPending ? 'Aprovando e cadastrando…' : 'Aprovar e cadastrar no Orçafascio'}
           </button>
         </div>
       </div>

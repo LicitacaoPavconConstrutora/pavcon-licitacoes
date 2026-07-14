@@ -3,6 +3,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { redirect } from 'next/navigation';
+import { otimizarPdfs } from '../[id]/actions';
 
 interface ActionResult {
   error?: string;
@@ -102,6 +103,15 @@ export async function createLicitacao(input: {
     .from('licitacoes')
     .update({ status: 'aguardando_extracao' })
     .eq('id', licitacao.id);
+
+  // 4) Auto-otimização dos PDFs (não fatal — só reduz tamanho/custo antes da
+  // extração; se falhar, o usuário segue normalmente e pode otimizar depois
+  // manualmente na tela da licitação).
+  try {
+    await otimizarPdfs(licitacao.id);
+  } catch (otimErr) {
+    console.error('[createLicitacao] otimizarPdfs falhou (não fatal)', otimErr);
+  }
 
   redirect(`/licitacoes/${licitacao.id}`);
 }
