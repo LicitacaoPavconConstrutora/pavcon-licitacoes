@@ -31,7 +31,7 @@ import {
 // LLM_PROVIDER abaixo pra 'anthropic' + importar de '../_shared/anthropic.ts'.
 import { callGemini, GeminiError, type GeminiPart, type GeminiTurn } from '../_shared/gemini.ts';
 import { callClaude, type ClaudeContent } from '../_shared/anthropic.ts';
-import { PROMPT_VERSION, SYSTEM_PROMPT } from './prompt.ts';
+import { PROMPT_VERSION, SYSTEM_PROMPT } from './prompt-v2.ts';
 
 // gemini-2.5-pro (definitivo). Tentamos 3.1-pro-preview duas vezes mas com
 // thinking mode ele estoura o cap de 400s do EdgeRuntime em PDFs reais —
