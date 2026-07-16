@@ -131,6 +131,14 @@ export async function analisarLicitacao(
     composicoesVazias,
     totalExtraidoServicos,
     totalOrcamentoOrcafascio,
+    // Habilita a ação "forçar total" via automação de navegador (Playwright)
+    // no Cláudio Proxy — a única forma segura hoje, já que a chamada HTTP
+    // direta ao Orçafascio corrompe orçamentos (ver detectores.ts detector 10).
+    // ATENÇÃO: CLAUDIO_PROXY_URL é lido aqui do ambiente do Vercel (frontend),
+    // que é SEPARADO dos secrets do Supabase — precisa configurar a mesma
+    // variável nos dois lugares (Vercel env vars + `supabase secrets set`),
+    // senão o botão nem aparece mesmo com o proxy configurado no Supabase.
+    claudioProxyDisponivel: !!process.env.CLAUDIO_PROXY_URL,
   };
 
   // 2) Roda detectores

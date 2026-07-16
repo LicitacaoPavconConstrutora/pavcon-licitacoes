@@ -18,6 +18,8 @@ interface AutoFixResult {
   error?: string;
   mensagem?: string;
   mudancas?: number;
+  /** Screenshots (base64 PNG) da automação de navegador — só em forcarTotalOrcamentoBase. */
+  screenshots?: Record<string, string>;
 }
 
 // Reusa o mesmo detector usado no importarExtracaoManual pra manter
@@ -279,6 +281,7 @@ export async function salvarMapeamentosCodes(
 export async function forcarTotalOrcamentoBase(
   licitacaoId: string,
   valorTotalAlvo: number,
+  opts?: { dryRun?: boolean },
 ): Promise<AutoFixResult> {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
@@ -312,20 +315,33 @@ export async function forcarTotalOrcamentoBase(
       licitacao_id: licitacaoId,
       credential_id: cred.id,
       valor_total_alvo: valorTotalAlvo,
+      dry_run: !!opts?.dryRun,
     }),
   });
   const text = await res.text();
   let body: Record<string, unknown> = {};
   try { body = JSON.parse(text); } catch {}
   if (!res.ok) {
-    return { error: `Ajustar valor falhou (${res.status}): ${(body.error as string) ?? text.slice(0, 200)}` };
+    return {
+      error: `Ajustar valor falhou (${res.status}): ${(body.error as string) ?? text.slice(0, 200)}`,
+      screenshots: body.screenshots as Record<string, string> | undefined,
+    };
+  }
+  if (opts?.dryRun) {
+    return {
+      ok: true,
+      mensagem: 'Dry-run: form preenchido no Orçafascio mas NÃO submetido. Confira os screenshots.',
+      screenshots: body.screenshots as Record<string, string> | undefined,
+    };
   }
   revalidatePath(`/licitacoes/${licitacaoId}`);
+  const aviso = body.aviso ? ` ⚠ ${body.aviso as string}` : '';
   return {
     ok: true,
     mensagem: `Total do orçamento ajustado pra R$ ${valorTotalAlvo.toFixed(2)}. ` +
-      `Abre o Orçafascio pra conferir — distribuição interna foi escalada.`,
+      `Abre o Orçafascio pra conferir — distribuição interna foi escalada.${aviso}`,
     mudancas: 1,
+    screenshots: body.screenshots as Record<string, string> | undefined,
   };
 }
 

@@ -198,6 +198,33 @@ Geralmente significa que o Cláudio na nuvem não consegue chegar no seu PC:
 
 ---
 
+## "Forçar total" via navegador (POST /ajustar-valor)
+
+Além do chat, o proxy também expõe automação de navegador (Playwright) pra
+aplicar "Ajustar valor" no Orçafascio com segurança. Isso existe porque a
+chamada HTTP direta ao endpoint interno do Orçafascio já **corrompeu
+orçamentos reais duas vezes** (histórico em `supabase/functions/_shared/
+orcafascio-web-v2023.ts`) — a automação de navegador clica no formulário
+real em vez de tentar adivinhar a chamada da API.
+
+Requer Chromium instalado (baixado automaticamente no `npm install` via
+`postinstall`; se falhar, rode `npx playwright install chromium` manualmente).
+
+**IMPORTANTE — antes de usar em qualquer orçamento real:**
+1. Peça pro Edge Function chamar com `dry_run: true` (ou teste direto:
+   `curl -X POST http://localhost:3001/ajustar-valor -H "Content-Type:
+   application/json" -d '{"budget_id":"...","valor_final":1000,
+   "cookie_header":"...","dry_run":true}'`) num orçamento de **teste**.
+2. Confira os screenshots (base64 PNG) na resposta — eles mostram se os
+   seletores acharam os elementos certos na tela.
+3. Se algo não bater, ajuste os textos em `ajustar-valor.js`
+   (`EDITAR_LINK_TEXTS`, `AJUSTAR_VALOR_LINK_TEXTS`, `SUBMIT_BUTTON_TEXTS`,
+   `FINAL_PRICE_INPUT_SELECTORS`) com base no que aparecer nos screenshots.
+4. Só depois disso confie em `dry_run: false` num orçamento real.
+
+Essa parte foi escrita sem acesso de rede ao Orçafascio pra testar — trate
+como um primeiro rascunho que precisa de validação manual, não como pronto.
+
 ## Limitações vs API direta
 
 | | Via Proxy Max | Via API Anthropic |

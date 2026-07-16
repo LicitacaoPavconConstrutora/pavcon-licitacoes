@@ -122,6 +122,7 @@ export function FloatingClaudio({ licitacaoId }: Props) {
   const [isPending, startTransition] = useTransition();
   const [erro, setErro] = useState<string | null>(null);
   const [sucesso, setSucesso] = useState<string | null>(null);
+  const [screenshotsForcarTotal, setScreenshotsForcarTotal] = useState<Record<string, string> | null>(null);
 
   // Chat state
   const [historico, setHistorico] = useState<ChatMensagem[]>([]);
@@ -299,25 +300,24 @@ export function FloatingClaudio({ licitacaoId }: Props) {
 
         // ============= FASE 2: ações determinísticas sem confirmação =============
         // tipos auto-aplicáveis (sem precisar de input do usuário):
-        //   - forcar_total_inline   → forcarTotalOrcamentoBase(valor_alvo)
         //   - codes_adaptados_nao_reclassificados → executarAutoFix(tipo)
         //   - aplicar_mapeamentos_pendentes       → executarAutoFix(tipo)
         // Skip: mapping_inline / definir_data_base_inline (precisam input)
+        //
+        // forcar_total_inline FICA DE FORA do modo turbo de propósito: a ação
+        // agora usa automação de navegador (Playwright, via Cláudio Proxy) que
+        // ainda não foi validada contra o Orçafascio real (ver claudio-proxy/
+        // ajustar-valor.js). Até alguém confirmar que funciona certo num
+        // orçamento de teste, exigimos o clique manual no botão "💰 Forçar
+        // total agora" (que já pede confirmação) em vez de disparar sem
+        // supervisão dentro do modo turbo. Depois de validado, pode entrar
+        // aqui igual aos outros.
         const fase2: string[] = [];
         for (const d of diagsRestantes) {
           const tipoAcao = d.acao_acionavel?.tipo;
           try {
             if (tipoAcao === 'forcar_total_inline') {
-              const valorAlvo = Number(d.acao_acionavel?.params?.valor_alvo);
-              if (Number.isFinite(valorAlvo) && valorAlvo > 0) {
-                const rr = await forcarTotalOrcamentoBase(licitacaoId, valorAlvo);
-                if (rr.error) {
-                  fase2.push(`✗ Forçar total falhou: ${rr.error}`);
-                } else {
-                  fase2.push(`✓ Total forçado pra R$ ${valorAlvo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`);
-                  totalAcoes++;
-                }
-              }
+              fase2.push('… "Forçar total" pendente — use o botão dedicado no diagnóstico (ainda não validado pro modo turbo automático).');
             } else if (AUTO_FIX_DISPONIVEL[d.tipo]) {
               const rr = await executarAutoFix(licitacaoId, d.tipo);
               if (rr.error) {
@@ -395,24 +395,34 @@ export function FloatingClaudio({ licitacaoId }: Props) {
     });
   }
 
-  function handleForcarTotal(diag: Diagnostico) {
+  function handleForcarTotal(diag: Diagnostico, dryRun: boolean) {
     const valorAlvo = Number(diag.acao_acionavel?.params?.valor_alvo);
     if (!Number.isFinite(valorAlvo) || valorAlvo <= 0) {
       setErro('valor_alvo inválido no diagnóstico.');
       return;
     }
-    if (!confirm(`Forçar total do orçamento pra R$ ${valorAlvo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}? Isso aplica fator linear em todos os itens.`)) {
+    if (!dryRun && !confirm(
+      `Forçar total do orçamento pra R$ ${valorAlvo.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}? ` +
+      'Isso aplica fator linear em todos os itens via automação de navegador (Playwright). ' +
+      'Se ainda não testou com "🔍 Testar (dry-run)" nesta licitação, recomendo fazer isso primeiro.'
+    )) {
       return;
     }
     setErro(null);
     setSucesso(null);
+    setScreenshotsForcarTotal(null);
     startTransition(async () => {
-      const r = await forcarTotalOrcamentoBase(licitacaoId, valorAlvo);
-      if (r.error) setErro(r.error);
-      else {
+      const r = await forcarTotalOrcamentoBase(licitacaoId, valorAlvo, { dryRun });
+      if (r.error) {
+        setErro(r.error);
+        if (r.screenshots) setScreenshotsForcarTotal(r.screenshots);
+      } else {
         setSucesso(r.mensagem ?? 'Total forçado com sucesso.');
-        const ar = await analisarLicitacao(licitacaoId);
-        if (ar.diagnosticos) setDiagnosticos(ar.diagnosticos as Diagnostico[]);
+        if (r.screenshots) setScreenshotsForcarTotal(r.screenshots);
+        if (!dryRun) {
+          const ar = await analisarLicitacao(licitacaoId);
+          if (ar.diagnosticos) setDiagnosticos(ar.diagnosticos as Diagnostico[]);
+        }
       }
     });
   }
@@ -643,6 +653,26 @@ export function FloatingClaudio({ licitacaoId }: Props) {
 
               {erro && <div className="mb-3 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-800">❌ {erro}</div>}
               {sucesso && <div className="mb-3 rounded-md border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-800">✓ {sucesso}</div>}
+              {screenshotsForcarTotal && (
+                <div className="mb-3 rounded-md border border-zinc-200 bg-zinc-50 p-2">
+                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                    Screenshots do Cláudio Proxy (confira se bateu certo)
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {Object.entries(screenshotsForcarTotal).map(([nome, b64]) => (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <a key={nome} href={`data:image/png;base64,${b64}`} target="_blank" rel="noreferrer" title={nome}>
+                        <img
+                          src={`data:image/png;base64,${b64}`}
+                          alt={nome}
+                          className="w-full rounded border border-zinc-300"
+                        />
+                        <p className="mt-0.5 truncate text-[9px] text-zinc-500">{nome}</p>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <div className="space-y-2">
                 {diagnosticos.map((d) => {
@@ -680,13 +710,23 @@ export function FloatingClaudio({ licitacaoId }: Props) {
                           </button>
                         )}
                         {d.acao_acionavel?.tipo === 'forcar_total_inline' && (
-                          <button
-                            onClick={() => handleForcarTotal(d)}
-                            disabled={isPending}
-                            className="rounded bg-pavcon-navy px-2 py-1 text-[10px] font-medium text-white hover:bg-pavcon-navy-dark disabled:opacity-50"
-                          >
-                            {d.acao_acionavel.label}
-                          </button>
+                          <>
+                            <button
+                              onClick={() => handleForcarTotal(d, true)}
+                              disabled={isPending}
+                              title="Preenche o formulário no Orçafascio mas NÃO submete — tira screenshots pra você conferir antes de rodar de verdade."
+                              className="rounded border border-pavcon-navy/40 bg-white px-2 py-1 text-[10px] font-medium text-pavcon-navy hover:bg-pavcon-navy-50 disabled:opacity-50"
+                            >
+                              🔍 Testar (dry-run)
+                            </button>
+                            <button
+                              onClick={() => handleForcarTotal(d, false)}
+                              disabled={isPending}
+                              className="rounded bg-pavcon-navy px-2 py-1 text-[10px] font-medium text-white hover:bg-pavcon-navy-dark disabled:opacity-50"
+                            >
+                              {d.acao_acionavel.label}
+                            </button>
+                          </>
                         )}
                         {d.acao_acionavel?.tipo === 'abrir_mapeamentos' && (
                           <Link
