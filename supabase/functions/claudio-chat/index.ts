@@ -25,6 +25,7 @@
 import { handleCorsPreflight } from '../_shared/cors.ts';
 import { errorResponse, jsonResponse } from '../_shared/json.ts';
 import { getServiceRoleClient, requireAuthenticatedUser } from '../_shared/supabase.ts';
+import { codesPendentesDaLicitacao } from '../_shared/codes-pendentes.ts';
 
 const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-4-5-20250929';
@@ -238,28 +239,12 @@ async function executarTool(
 
   if (toolName === 'consultar_codes_pendentes') {
     const limit = Math.min(Number(input.limit ?? 10), 50);
-    const { data: composicoes } = await admin
-      .from('composicoes_extraidas')
-      .select('id')
-      .eq('licitacao_id', licitacaoId)
-      .eq('fonte', 'PROPRIA');
-    const compIds = (composicoes ?? []).map((c) => c.id);
-    if (compIds.length === 0) return { codes: [] };
-    const { data: subs } = await admin
-      .from('composicao_propria_itens')
-      .select('codigo, fonte')
-      .in('composicao_extraida_id', compIds);
-    const setCodes = new Set(
-      (subs ?? []).map((s) => `${(s.fonte ?? '').toUpperCase()}/${s.codigo ?? ''}`),
-    );
-    const { data: mappings } = await admin
-      .from('orcafascio_code_mappings')
-      .select('fonte_original, codigo_original, descricao')
-      .is('codigo_substituto', null)
-      .limit(limit);
-    const codes = (mappings ?? []).filter((m) =>
-      setCodes.has(`${(m.fonte_original ?? '').toUpperCase()}/${m.codigo_original ?? ''}`),
-    );
+    // codesPendentesDaLicitacao já escopa pela licitação antes de aplicar
+    // qualquer corte — ver _shared/codes-pendentes.ts. O `limit` aqui é só
+    // pra não devolver uma lista gigante pro Claude, aplicado DEPOIS do
+    // escopo (antes disso, o .limit() ia direto na query global e podia
+    // cortar antes mesmo de saber quais eram relevantes pra esta licitação).
+    const codes = (await codesPendentesDaLicitacao(admin, licitacaoId)).slice(0, limit);
     return { codes };
   }
 

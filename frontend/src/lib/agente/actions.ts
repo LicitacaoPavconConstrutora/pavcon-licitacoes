@@ -11,6 +11,48 @@ interface DiagnosticoPersistido extends Diagnostico {
   detectado_em: string;
 }
 
+// Alguns detectores emitem `tipo` diferente dependendo de config de ambiente
+// (ex.: orcamento_abaixo_do_edital_auto/_manual conforme
+// claudioProxyDisponivel em detectores.ts) — não é o problema "sumindo",
+// é a MESMA questão com apresentação diferente. Reconciliação usa esse tipo
+// canônico; sem isso, a config oscilando marca falsamente o diagnóstico
+// como "resolvido_manualmente" (atribuído a quem só re-rodou a análise) e
+// insere um novo, gerando ruído no histórico.
+function tipoCanonico(tipo: string): string {
+  if (tipo === 'orcamento_abaixo_do_edital_auto' || tipo === 'orcamento_abaixo_do_edital_manual') {
+    return 'orcamento_abaixo_do_edital';
+  }
+  return tipo;
+}
+
+/**
+ * Pergunta pro Supabase (não pras próprias env vars do Vercel) se o
+ * "Forçar Total" automático está disponível. ANTES disso, o frontend lia
+ * CLAUDIO_PROXY_URL/FORCAR_TOTAL_AUTO_DESATIVADO do AMBIENTE DO VERCEL,
+ * um store de config separado dos secrets do Supabase (onde a Edge
+ * Function realmente roda) — exigia configurar a mesma coisa em dois
+ * lugares, e se só um fosse atualizado, o botão aparecia mas sempre
+ * falhava (ou sumia mesmo com o backend pronto). Agora o Supabase é a
+ * ÚNICA fonte de verdade: essa function chama o healthcheck da própria
+ * Edge Function em vez de reler env vars locais. Timeout curto + fallback
+ * seguro (false = mostra só o aviso manual) se a chamada falhar.
+ */
+async function verificarForcarTotalDisponivel(): Promise<boolean> {
+  try {
+    const url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/orcafascio-ajustar-total`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}` },
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    return !!body.disponivel;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Roda análise completa na licitação: coleta contexto, executa todos os
  * detectores, e persiste os diagnósticos novos. Diagnósticos antigos com
@@ -69,7 +111,11 @@ export async function analisarLicitacao(
     : null;
 
   // Codes pendentes da tabela orcafascio_code_mappings que tocam essa
-  // licitação (filtra por sub-itens das composições próprias)
+  // licitação (filtra por sub-itens das composições próprias). MESMA lógica
+  // existe em supabase/functions/_shared/codes-pendentes.ts, usada por
+  // claudio-chat e orcapav-corrigir-gemini — não dá pra importar aquele
+  // módulo Deno daqui (runtime separado, Vercel/Next.js), então se a regra
+  // de escopo mudar, espelhe a mudança nos dois lugares.
   const propriasIds = (servicos ?? [])
     .filter((s) => s.fonte === 'PROPRIA' && s.orcafascio_composition_id)
     .map((s) => s.orcafascio_composition_id ?? '')
@@ -123,6 +169,15 @@ export async function analisarLicitacao(
     }
   }
 
+  // Habilita a ação "forçar total" via automação de navegador (Playwright)
+  // no Cláudio Proxy — a única forma segura hoje, já que a chamada HTTP
+  // direta ao Orçafascio corrompe orçamentos (ver detectores.ts detector 10).
+  // Fonte de verdade: o Supabase (via healthcheck), não env vars do Vercel
+  // (ver verificarForcarTotalDisponivel). Kill-switch FORCAR_TOTAL_AUTO_DESATIVADO
+  // é checado do lado do Supabase — sete lá (não precisa mexer no Vercel)
+  // pra desligar a automação imediatamente sem reverter/redeployar código.
+  const claudioProxyDisponivel = await verificarForcarTotalDisponivel();
+
   const ctx: ContextoAnalise = {
     licitacao: licitacao as ContextoAnalise['licitacao'],
     cabecalho,
@@ -131,22 +186,7 @@ export async function analisarLicitacao(
     composicoesVazias,
     totalExtraidoServicos,
     totalOrcamentoOrcafascio,
-    // Habilita a ação "forçar total" via automação de navegador (Playwright)
-    // no Cláudio Proxy — a única forma segura hoje, já que a chamada HTTP
-    // direta ao Orçafascio corrompe orçamentos (ver detectores.ts detector 10).
-    // ATENÇÃO: CLAUDIO_PROXY_URL é lido aqui do ambiente do Vercel (frontend),
-    // que é SEPARADO dos secrets do Supabase — precisa configurar a mesma
-    // variável nos dois lugares (Vercel env vars + `supabase secrets set`),
-    // senão o botão nem aparece mesmo com o proxy configurado no Supabase.
-    //
-    // KILL-SWITCH: se a automação de navegador se comportar mal em produção,
-    // sete FORCAR_TOTAL_AUTO_DESATIVADO=true (só no Vercel) pra voltar
-    // IMEDIATAMENTE ao aviso manual de antes ("Editar → Ajustar valor" no
-    // Orçafascio), sem precisar desconfigurar o proxy inteiro (que o chat
-    // também usa) nem reverter/redeployar código.
-    claudioProxyDisponivel:
-      !!process.env.CLAUDIO_PROXY_URL &&
-      process.env.FORCAR_TOTAL_AUTO_DESATIVADO !== 'true',
+    claudioProxyDisponivel,
   };
 
   // 2) Roda detectores
@@ -158,11 +198,13 @@ export async function analisarLicitacao(
     .select('id, tipo, status')
     .eq('licitacao_id', licitacaoId)
     .eq('status', 'pendente');
-  const tiposExistentes = new Set((existentes ?? []).map((e) => e.tipo));
-  const tiposNovos = new Set(novos.map((n) => n.tipo));
+  const existentePorCanonico = new Map(
+    (existentes ?? []).map((e) => [tipoCanonico(e.tipo), e]),
+  );
+  const canonicosNovos = new Set(novos.map((n) => tipoCanonico(n.tipo)));
 
-  // 4) Insere os diagnósticos novos (que não existem como pendente)
-  const aInserir = novos.filter((n) => !tiposExistentes.has(n.tipo));
+  // 4) Insere os diagnósticos genuinamente novos (canônico não existia)
+  const aInserir = novos.filter((n) => !existentePorCanonico.has(tipoCanonico(n.tipo)));
   if (aInserir.length > 0) {
     await admin.from('agente_diagnosticos').insert(
       aInserir.map((d) => ({
@@ -178,9 +220,33 @@ export async function analisarLicitacao(
     );
   }
 
-  // 5) Marca como resolvidos os diagnósticos pendentes que sumiram
+  // 4.5) Atualiza os que continuam com o mesmo canônico mas mudaram de tipo
+  // específico (ex.: proxy ficou disponível entre duas análises) — refresca
+  // conteúdo/ação no MESMO registro em vez de resolver+recriar.
+  const aAtualizar = novos.filter((n) => {
+    const existente = existentePorCanonico.get(tipoCanonico(n.tipo));
+    return existente && existente.tipo !== n.tipo;
+  });
+  for (const d of aAtualizar) {
+    const existente = existentePorCanonico.get(tipoCanonico(d.tipo))!;
+    await admin
+      .from('agente_diagnosticos')
+      .update({
+        tipo: d.tipo,
+        severidade: d.severidade,
+        titulo: d.titulo,
+        mensagem: d.mensagem ?? null,
+        sugestao: d.sugestao ?? null,
+        acao_acionavel: d.acao_acionavel ?? null,
+        contexto: d.contexto ?? null,
+      })
+      .eq('id', existente.id);
+  }
+
+  // 5) Marca como resolvidos os diagnósticos pendentes cujo canônico
+  // realmente sumiu (não é só troca de apresentação)
   const aResolver = (existentes ?? [])
-    .filter((e) => !tiposNovos.has(e.tipo))
+    .filter((e) => !canonicosNovos.has(tipoCanonico(e.tipo)))
     .map((e) => e.id);
   if (aResolver.length > 0) {
     await admin

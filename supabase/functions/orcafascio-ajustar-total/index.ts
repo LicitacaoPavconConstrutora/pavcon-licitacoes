@@ -36,6 +36,10 @@ import {
   authenticateOrcafascioWeb,
   OrcafascioWebError,
 } from '../_shared/orcafascio-web.ts';
+import {
+  ajustarValorViaProxy,
+  AjustarValorProxyError,
+} from '../_shared/ajustar-valor-proxy.ts';
 
 interface RequestBody {
   licitacao_id?: string;
@@ -45,21 +49,25 @@ interface RequestBody {
   trace_id?: string;
 }
 
-interface ProxyAjustarValorResponse {
-  ok: boolean;
-  dry_run?: boolean;
-  error?: string;
-  aviso?: string;
-  total_confere_na_pagina?: boolean;
-  valor_esperado_formatado?: string;
-  passos?: string[];
-  screenshots?: Record<string, string>;
-}
-
 Deno.serve(async (req: Request) => {
   const cors = handleCorsPreflight(req);
   if (cors) return cors;
-  if (req.method !== 'POST') return errorResponse(405, 'Use POST.');
+
+  // ---- GET /?disponibilidade — healthcheck de configuração ------------------
+  // O frontend (Vercel) precisa saber se pode oferecer o botão "Forçar
+  // Total", mas CLAUDIO_PROXY_URL/FORCAR_TOTAL_AUTO_DESATIVADO são secrets
+  // do SUPABASE — configuráveis independentemente das env vars do Vercel.
+  // Manter os dois em sincronia manualmente é frágil (ver histórico: botão
+  // aparece mas 503, ou botão some mesmo com o backend pronto). Esta rota
+  // faz do Supabase a ÚNICA fonte de verdade: o frontend chama aqui em vez
+  // de reler suas próprias env vars.
+  if (req.method === 'GET') {
+    const disponivel = !!Deno.env.get('CLAUDIO_PROXY_URL') &&
+      Deno.env.get('FORCAR_TOTAL_AUTO_DESATIVADO') !== 'true';
+    return jsonResponse({ disponivel });
+  }
+
+  if (req.method !== 'POST') return errorResponse(405, 'Use GET (healthcheck) ou POST.');
 
   let body: RequestBody;
   try { body = await req.json(); } catch { return errorResponse(400, 'JSON inválido.'); }
@@ -105,63 +113,33 @@ Deno.serve(async (req: Request) => {
     });
 
     // ---- 3) Delega o ajuste pro Cláudio Proxy (automação de navegador) -----
-    // Exigido: chamar o endpoint interno do Orçafascio direto via fetch já
-    // corrompeu orçamentos reais 2x (ver comentário no topo do arquivo). Sem
-    // o proxy configurado, recusamos em vez de arriscar.
-    // Kill-switch: sete FORCAR_TOTAL_AUTO_DESATIVADO=true (secret do Supabase)
-    // pra desligar essa function imediatamente, sem reverter/redeployar
-    // código. Espelha o mesmo flag checado no frontend (actions.ts) —
-    // checado aqui de novo como segunda camada, caso a function seja
-    // chamada direto sem passar pela tela.
-    if (Deno.env.get('FORCAR_TOTAL_AUTO_DESATIVADO') === 'true') {
-      return errorResponse(
-        503,
-        'Forçar total automático está desativado (FORCAR_TOTAL_AUTO_DESATIVADO=true). ' +
-          'Ajuste o valor manualmente no Orçafascio ("Editar → Ajustar valor").',
-      );
-    }
-
-    const proxyUrl = Deno.env.get('CLAUDIO_PROXY_URL');
-    const proxyToken = Deno.env.get('CLAUDIO_PROXY_TOKEN') ?? '';
-    if (!proxyUrl) {
-      return errorResponse(
-        503,
-        'Forçar total requer o Cláudio Proxy configurado (CLAUDIO_PROXY_URL) — ' +
-          'a chamada direta à API do Orçafascio foi desativada por corromper orçamentos. ' +
-          'Configure o proxy local (vide claudio-proxy/README.md) ou ajuste o valor ' +
-          'manualmente no Orçafascio ("Editar → Ajustar valor").',
-      );
-    }
-
-    let proxyResult: ProxyAjustarValorResponse;
-    try {
-      const resp = await fetch(`${proxyUrl}/ajustar-valor`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          ...(proxyToken ? { authorization: `Bearer ${proxyToken}` } : {}),
-        },
-        body: JSON.stringify({
-          budget_id: budgetId,
-          valor_final: valorAlvo,
-          cookie_header: session.cookie_header,
-          dry_run: !!body.dry_run,
-        }),
-      });
-      proxyResult = await resp.json();
-      if (!resp.ok && proxyResult.ok === undefined) {
-        return errorResponse(502, `Cláudio Proxy respondeu ${resp.status}.`, proxyResult);
-      }
-    } catch (e) {
-      return errorResponse(
-        502,
-        'Não consegui alcançar o Cláudio Proxy — confirme que ele e o tunnel estão rodando.',
-        { message: e instanceof Error ? e.message : String(e) },
-      );
-    }
+    // Kill-switch, checagem de proxy configurado, sessão viva e log de
+    // auditoria são todos centralizados em ajustarValorViaProxy — não
+    // reimplementar aqui (ver _shared/ajustar-valor-proxy.ts).
+    const proxyResult = await ajustarValorViaProxy(admin, session, {
+      budgetId,
+      valorFinal: valorAlvo as number,
+      dryRun: !!body.dry_run,
+      callerUserId: user.id,
+      licitacaoId,
+      traceId,
+    });
 
     if (!proxyResult.ok) {
-      return errorResponse(502, proxyResult.error ?? 'Ajustar valor falhou no proxy.', proxyResult);
+      // IMPORTANTE: NÃO usar errorResponse aqui — ele aninha proxyResult
+      // sob "details", e o frontend (auto-fixes.ts) lê screenshots no nível
+      // raiz do body. Screenshots são justamente o que o orçamentista
+      // precisa ver quando a automação falha (seletor não achado, sessão
+      // expirou no meio, etc.) — aninhar os esconderia exatamente na hora
+      // em que mais importam.
+      return jsonResponse({
+        ok: false,
+        error: proxyResult.error ?? 'Ajustar valor falhou no proxy.',
+        aviso: proxyResult.aviso,
+        passos: proxyResult.passos,
+        screenshots: proxyResult.screenshots,
+        trace_id: traceId,
+      }, 502);
     }
 
     return jsonResponse({
@@ -182,6 +160,9 @@ Deno.serve(async (req: Request) => {
   } catch (err) {
     if (err instanceof OrcafascioWebError) {
       return errorResponse(502, `Auth Orçafascio falhou: ${err.message}`, { code: err.code });
+    }
+    if (err instanceof AjustarValorProxyError) {
+      return errorResponse(err.status, err.message);
     }
     const msg = err instanceof Error ? err.message : String(err);
     return errorResponse(500, `Erro inesperado: ${msg}`);

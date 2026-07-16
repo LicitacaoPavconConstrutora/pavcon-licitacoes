@@ -34,10 +34,20 @@ const BASE = 'https://app.orcafascio.com';
 const EDITAR_LINK_TEXTS = ['Editar'];
 const AJUSTAR_VALOR_LINK_TEXTS = ['Ajustar valor', 'Ajustar Valor'];
 const SUBMIT_BUTTON_TEXTS = ['Confirmar', 'Aplicar', 'Ajustar', 'Salvar', 'OK', 'Enviar'];
-const FINAL_PRICE_INPUT_SELECTORS = [
+
+// Seletores ESPECÍFICOS pro campo de valor final — se um destes achar o
+// elemento, confiamos e seguimos (mesmo em dryRun:false).
+const FINAL_PRICE_INPUT_SELECTORS_ESPECIFICOS = [
   'input[name="final_price"]',
   'input#final_price',
   'input[name*="final_price" i]',
+];
+// Fallback GENÉRICO — só serve pra dryRun (screenshot pra ajuste manual dos
+// seletores). NUNCA usado pra submeter de verdade: um input[type=text] ou
+// [type=number] genérico pode ser QUALQUER campo da página (busca,
+// quantidade, etc), não necessariamente o valor final. Ver
+// `findFinalPriceInput` — a confiança retornada decide se pode submeter.
+const FINAL_PRICE_INPUT_SELECTORS_GENERICOS = [
   'input[type="text"]',
   'input[type="number"]',
 ];
@@ -60,14 +70,23 @@ function formatBRL(value) {
   return value.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-async function clickByText(page, texts, { timeout = 4000 } = {}) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.exigirUnico] - se true, recusa clicar quando o texto
+ *        bate em MAIS DE UM elemento na página (ambíguo — ex: vários links
+ *        "Editar", um por linha do orçamento). Em vez de arriscar `.first()`
+ *        clicar no elemento errado, retorna false pro caller cair no
+ *        fallback (navegação direta por URL).
+ */
+async function clickByText(page, texts, { timeout = 4000, exigirUnico = false } = {}) {
   for (const text of texts) {
-    const loc = page.getByText(text, { exact: false }).first();
+    const loc = page.getByText(text, { exact: false });
     try {
-      if ((await loc.count()) > 0) {
-        await loc.click({ timeout });
-        return true;
-      }
+      const count = await loc.count();
+      if (count === 0) continue;
+      if (exigirUnico && count > 1) continue; // ambíguo — tenta próximo texto/fallback
+      await loc.first().click({ timeout });
+      return true;
     } catch {
       // tenta o próximo texto
     }
@@ -75,10 +94,26 @@ async function clickByText(page, texts, { timeout = 4000 } = {}) {
   return false;
 }
 
+/**
+ * Acha o campo de valor final. Retorna `{ locator, confianca }` onde
+ * `confianca` é:
+ *   'especifico' — bateu num seletor que só existe se for o campo certo
+ *                  (name/id contendo "final_price"). Seguro pra submeter.
+ *   'generico'   — só achou via fallback genérico (qualquer input de texto/
+ *                  número). NÃO é seguro submeter — pode ser um campo
+ *                  qualquer da página. Só serve pra screenshot de dryRun,
+ *                  pra quem for ajustar os seletores acima ver o que tem
+ *                  na tela.
+ * Retorna `null` se não achou nada.
+ */
 async function findFinalPriceInput(page) {
-  for (const sel of FINAL_PRICE_INPUT_SELECTORS) {
+  for (const sel of FINAL_PRICE_INPUT_SELECTORS_ESPECIFICOS) {
     const loc = page.locator(sel).first();
-    if ((await loc.count()) > 0) return loc;
+    if ((await loc.count()) > 0) return { locator: loc, confianca: 'especifico' };
+  }
+  for (const sel of FINAL_PRICE_INPUT_SELECTORS_GENERICOS) {
+    const loc = page.locator(sel).first();
+    if ((await loc.count()) > 0) return { locator: loc, confianca: 'generico' };
   }
   return null;
 }
@@ -120,8 +155,12 @@ export async function ajustarValorViaBrowser({ budgetId, valorFinal, cookieHeade
     passos.push('budget_aberto');
 
     // ---- 2) Tenta o caminho "Editar → Ajustar valor" (igual um humano) ------
+    // exigirUnico:true no "Editar": uma página de orçamento provavelmente
+    // tem vários links "Editar" (um por linha/item) — clicar no primeiro
+    // que aparecer pode levar pro lugar errado. Se for ambíguo, cai pro
+    // fallback de navegação direta por URL em vez de arriscar.
     let chegouNoForm = false;
-    if (await clickByText(page, EDITAR_LINK_TEXTS)) {
+    if (await clickByText(page, EDITAR_LINK_TEXTS, { exigirUnico: true })) {
       passos.push('clicou_editar');
       await page.waitForTimeout(500);
       if (await clickByText(page, AJUSTAR_VALOR_LINK_TEXTS)) {
@@ -143,21 +182,41 @@ export async function ajustarValorViaBrowser({ budgetId, valorFinal, cookieHeade
     screenshots.form_ajustar_valor = await page.screenshot({ encoding: 'base64', fullPage: false });
 
     // ---- 3) Preenche o campo de valor final -----------------------------------
-    const input = await findFinalPriceInput(page);
-    if (!input) {
+    const achado = await findFinalPriceInput(page);
+    if (!achado) {
       return {
         ok: false,
-        error: 'Não encontrei o campo de valor final na tela. Confira os screenshots e ajuste FINAL_PRICE_INPUT_SELECTORS.',
+        error: 'Não encontrei o campo de valor final na tela. Confira os screenshots e ajuste FINAL_PRICE_INPUT_SELECTORS_ESPECIFICOS.',
         passos,
         screenshots,
       };
     }
+    const { locator: input, confianca } = achado;
     await input.fill(valorFinal.toFixed(2));
     screenshots.form_preenchido = await page.screenshot({ encoding: 'base64', fullPage: false });
-    passos.push('form_preenchido');
+    passos.push(`form_preenchido(confianca=${confianca})`);
 
     if (dryRun) {
-      return { ok: true, dry_run: true, passos, screenshots };
+      return { ok: true, dry_run: true, confianca_campo: confianca, passos, screenshots };
+    }
+
+    // SEGURANÇA: nunca submete de verdade se o campo só foi achado pelo
+    // fallback genérico (pode ser QUALQUER input da página, não
+    // necessariamente o valor final). Força o caller a tratar isso como um
+    // dry-run — precisa ajustar FINAL_PRICE_INPUT_SELECTORS_ESPECIFICOS
+    // primeiro (olhando o screenshot form_preenchido) antes de confiar.
+    if (confianca === 'generico') {
+      return {
+        ok: false,
+        dry_run: true,
+        error:
+          'Campo de valor final só foi achado via seletor GENÉRICO (não confiável pra submeter). ' +
+          'Confira o screenshot form_preenchido e ajuste FINAL_PRICE_INPUT_SELECTORS_ESPECIFICOS em ' +
+          'ajustar-valor.js antes de tentar de novo.',
+        confianca_campo: confianca,
+        passos,
+        screenshots,
+      };
     }
 
     // ---- 4) Submete -----------------------------------------------------------

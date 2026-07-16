@@ -103,6 +103,55 @@ interface ComposicaoPropriaItem {
   preco_unitario: number | null;
 }
 
+/**
+ * Cria (ou reusa) um Resource no MyBase com um preço fixo. Usado tanto pras
+ * sub-composições PROPRIA auxiliares (AUX_) quanto pro fallback de preço de
+ * composições vazias (FALLBACK_) — extraído aqui pra não duplicar a lógica
+ * de staleness (as duas precisam do MESMO cuidado: se o resource já existe
+ * mas com preço zerado/desatualizado, apaga e recria em vez de reusar
+ * cegamente).
+ */
+async function upsertPricedResource(
+  ctx: Parameters<typeof createResource>[0],
+  opts: {
+    code: string;
+    description: string;
+    unit: string;
+    uf: string;
+    groupId: string;
+    preco: number;
+    note: string;
+  },
+): Promise<{ resource_code: string }> {
+  const existing = await findMyBaseResourceByCode(ctx, opts.code);
+  if (existing) {
+    // Se o preço existente está zerado (criado por versão buggy anterior)
+    // e agora temos um preço de verdade, apaga e recria. Do contrário
+    // reusa — evita apagar/recriar resources à toa em todo run.
+    const existingPnd = Number(existing.locals?.[opts.uf]?.pnd ?? 0);
+    if (existingPnd > 0 || opts.preco === 0) {
+      return { resource_code: existing.code };
+    }
+    await deleteResource(ctx, existing.id);
+  }
+  const resource = await createResource(ctx, {
+    group_id: opts.groupId,
+    code: opts.code,
+    description: opts.description.slice(0, 500),
+    type: RESOURCE_TYPE.OUTROS,
+    unit: opts.unit.slice(0, 20),
+    local: opts.uf,
+    // Mesmo preço nos 4 campos — não desonerado/desonerado/improdutivo
+    // (o cálculo correto vem do BDI + leis sociais do orçamento).
+    pnd: opts.preco,
+    pd: opts.preco,
+    pndi: opts.preco,
+    pdi: opts.preco,
+    note: opts.note,
+  });
+  return { resource_code: resource.code };
+}
+
 const ERR_AUTH_TO_HTTP: Record<OrcafascioAuthError['code'], number> = {
   credential_not_found: 404,
   credential_inactive: 403,
@@ -504,42 +553,16 @@ Deno.serve(async (req: Request) => {
         const auxCode = `AUX_${licitacaoId.slice(0, 8)}_${aux.codigo!}`.slice(0, 50);
         const preco = aux.preco_unitario != null ? Number(aux.preco_unitario) : 0;
         try {
-          const existing = await findMyBaseResourceByCode(ctx, auxCode);
-          if (existing) {
-            // Se o preço existente está zerado (criado por versão buggy
-            // anterior), apaga e recria com o preço correto.
-            const existingPnd = Number(
-              existing.locals?.[uf]?.pnd ?? 0,
-            );
-            if (existingPnd > 0 || preco === 0) {
-              auxByOriginalCode.set(aux.codigo!, { resource_code: existing.code });
-              continue;
-            }
-            console.log(
-              `[cadastrar-edital] resource ${auxCode} existente com pnd=${existingPnd} — recriando com ${preco}`,
-            );
-            await deleteResource(ctx, existing.id).catch((e) => {
-              warnings.push(
-                `Falha ao apagar resource zerado ${auxCode}: ${e instanceof Error ? e.message.slice(0, 100) : String(e)}`,
-              );
-            });
-          }
-          const resource = await createResource(ctx, {
-            group_id: grupo.id,
+          const { resource_code } = await upsertPricedResource(ctx, {
             code: auxCode,
-            description: (aux.descricao ?? `Sub-composição auxiliar ${aux.codigo}`).slice(0, 500),
-            type: RESOURCE_TYPE.OUTROS,
-            unit: (aux.unidade ?? 'un').slice(0, 20),
-            local: uf,
-            // Mesmo preço nos 4 campos — não desonerado/desonerado/improdutivo
-            // (o cálculo correto vem do BDI + leis sociais do orçamento)
-            pnd: preco,
-            pd: preco,
-            pndi: preco,
-            pdi: preco,
+            description: aux.descricao ?? `Sub-composição auxiliar ${aux.codigo}`,
+            unit: aux.unidade ?? 'un',
+            uf,
+            groupId: grupo.id,
+            preco,
             note: `Auxiliar do edital ${licitacao.numero_edital ?? licitacao.id.slice(0, 8)}. Código original "${aux.codigo}".`,
           });
-          auxByOriginalCode.set(aux.codigo!, { resource_code: resource.code });
+          auxByOriginalCode.set(aux.codigo!, { resource_code });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           warnings.push(`Resource auxiliar "${auxCode}" — falhou: ${msg.slice(0, 200)}`);
@@ -733,27 +756,49 @@ Deno.serve(async (req: Request) => {
         if (precoConhecido > 0) {
           const fallbackCode = `FALLBACK_${codigo}`.slice(0, 50);
           try {
-            let resource = await findMyBaseResourceByCode(ctx, fallbackCode);
-            if (!resource) {
-              resource = await createResource(ctx, {
-                group_id: grupo.id,
-                code: fallbackCode,
-                description: `${descricao} (preço do edital — sem detalhamento de insumos)`.slice(0, 500),
-                type: RESOURCE_TYPE.OUTROS,
-                unit: unidade,
-                local: uf,
-                pnd: precoConhecido,
-                pd: precoConhecido,
-                pndi: precoConhecido,
-                pdi: precoConhecido,
-                note:
-                  `Fallback automático: composição "${comp.item_codigo}" sem detalhamento no JSON do ` +
-                  'edital. Preço reproduzido de composicoes_extraidas.preco_unitario_sem_bdi (extraído ' +
-                  'da planilha oficial). Substitua por insumos reais quando/se a planilha auxiliar ' +
-                  'do órgão for localizada.',
+            const { resource_code } = await upsertPricedResource(ctx, {
+              code: fallbackCode,
+              description: `${descricao} (preço do edital — sem detalhamento de insumos)`,
+              unit: unidade,
+              uf,
+              groupId: grupo.id,
+              preco: precoConhecido,
+              note:
+                `Fallback automático: composição "${comp.item_codigo}" sem detalhamento no JSON do ` +
+                'edital. Preço reproduzido de composicoes_extraidas.preco_unitario_sem_bdi (extraído ' +
+                'da planilha oficial). Substitua por insumos reais quando/se a planilha auxiliar ' +
+                'do órgão for localizada.',
+            });
+            itemsParaApi.push({ bank: 'MYBASE', code: resource_code, qty: 1, type: 'resource' });
+
+            // Grava também na NOSSA tabela (composicao_propria_itens) — sem
+            // isso, composicoesVazias (frontend/src/lib/agente/actions.ts)
+            // continuava marcando esta composição como "vazia" pra sempre,
+            // mesmo depois do fallback já ter preenchido o preço no
+            // Orçafascio, e o detector de "total abaixo do edital" seguia
+            // oferecendo "Forçar Total" e inflando um total que já batia.
+            const { error: subItemErr } = await admin
+              .from('composicao_propria_itens')
+              .insert({
+                composicao_extraida_id: comp.id,
+                classe: 'INSUMO',
+                codigo: resource_code,
+                fonte: 'OUTRA',
+                descricao: `${descricao} (preço do edital — fallback automático, sem detalhamento real de insumos)`.slice(0, 500),
+                unidade,
+                coeficiente: 1,
+                preco_unitario: precoConhecido,
+                preco_total: precoConhecido,
+                orcafascio_resource_id: resource_code,
+                ordem: 0,
               });
+            if (subItemErr) {
+              warnings.push(
+                `Composição "${codigo}": fallback de preço aplicado no Orçafascio, mas falhou ao registrar ` +
+                  `localmente (${subItemErr.message.slice(0, 150)}) — pode continuar aparecendo como "vazia" nos diagnósticos.`,
+              );
             }
-            itemsParaApi.push({ bank: 'MYBASE', code: resource.code, qty: 1, type: 'resource' });
+
             warnings.push(
               `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}): sem detalhamento no JSON do edital — ` +
                 `preenchida com o preço já extraído da planilha oficial (R$ ${precoConhecido.toFixed(2)}, sem BDI) ` +

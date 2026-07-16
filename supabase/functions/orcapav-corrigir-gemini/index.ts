@@ -21,6 +21,7 @@
 import { handleCorsPreflight } from '../_shared/cors.ts';
 import { errorResponse, jsonResponse } from '../_shared/json.ts';
 import { getServiceRoleClient, requireAuthenticatedUser } from '../_shared/supabase.ts';
+import { codesPendentesDaLicitacao } from '../_shared/codes-pendentes.ts';
 
 const GEMINI_FLASH = 'gemini-2.5-flash';
 const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta';
@@ -204,7 +205,7 @@ async function executarTool(
       .select('status, cadastro_resumo')
       .eq('id', licitacaoId)
       .maybeSingle();
-    const codes = await codesPendentesDaLicitacao(licitacaoId, admin);
+    const codes = await codesPendentesDaLicitacao(admin, licitacaoId);
     return {
       status: lic?.status,
       warnings_recentes:
@@ -220,46 +221,9 @@ async function executarTool(
   return { ok: false, error: `Tool desconhecida: ${name}` };
 }
 
-// =============================================================================
-// Codes pendentes de mapeamento RELEVANTES pra essa licitação.
-// =============================================================================
-// BUG (jul/2026): antes essa função (e a tool obter_estado_atual) buscavam
-// `orcafascio_code_mappings` SEM filtrar por licitação — orcafascio_code_mappings
-// é uma tabela GLOBAL (reusada entre editais futuros, sem coluna licitacao_id),
-// então a query pegava "os 30 primeiros pendentes do sistema inteiro". Depois
-// de meses rodando várias licitações, os codes relevantes desta licitação
-// podiam nem entrar nesse corte — o Gemini respondia "nenhum código pendente"
-// mesmo quando ESTA licitação tinha pendências reais. Mesmo padrão de filtro
-// já usado em frontend/src/lib/agente/actions.ts (analisarLicitacao).
-async function codesPendentesDaLicitacao(
-  licitacaoId: string,
-  admin: ReturnType<typeof getServiceRoleClient>,
-): Promise<Array<{ fonte_original: string; codigo_original: string; descricao: string | null }>> {
-  const { data: proprias } = await admin
-    .from('composicoes_extraidas')
-    .select('id')
-    .eq('licitacao_id', licitacaoId)
-    .eq('fonte', 'PROPRIA');
-  const compIds = (proprias ?? []).map((c) => c.id);
-  if (compIds.length === 0) return [];
-
-  const { data: subitens } = await admin
-    .from('composicao_propria_itens')
-    .select('codigo, fonte')
-    .in('composicao_extraida_id', compIds);
-  const codesDaLicitacao = new Set(
-    (subitens ?? []).map((s) => `${(s.fonte ?? '').toUpperCase()}/${s.codigo ?? ''}`),
-  );
-  if (codesDaLicitacao.size === 0) return [];
-
-  const { data: pendentes } = await admin
-    .from('orcafascio_code_mappings')
-    .select('fonte_original, codigo_original, descricao')
-    .is('codigo_substituto', null);
-  return (pendentes ?? []).filter((m) =>
-    codesDaLicitacao.has(`${(m.fonte_original ?? '').toUpperCase()}/${m.codigo_original ?? ''}`),
-  );
-}
+// codesPendentesDaLicitacao agora vem de ../_shared/codes-pendentes.ts —
+// ver esse arquivo pro histórico do bug de escopo (jul/2026) e pra evitar
+// uma 4ª cópia divergente desta mesma lógica.
 
 // =============================================================================
 // Coleta inicial do contexto pra mandar pro Gemini
@@ -276,7 +240,7 @@ async function coletarContexto(
 
   const warnings = (lic?.cadastro_resumo as { warnings?: string[] } | null)?.warnings ?? [];
 
-  const codesPend = await codesPendentesDaLicitacao(licitacaoId, admin);
+  const codesPend = await codesPendentesDaLicitacao(admin, licitacaoId);
 
   // composições proprias da licitação (pra detectar -ADAP)
   const { data: comps } = await admin

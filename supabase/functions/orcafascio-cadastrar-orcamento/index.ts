@@ -43,7 +43,6 @@ import {
 } from '../_shared/orcafascio-web.ts';
 import {
   addItemsBatch,
-  ajustarValor,
   type BudgetItem,
   createBudget,
   createContext,
@@ -54,6 +53,10 @@ import {
   updateLeisSociais,
   uuidv4,
 } from '../_shared/orcafascio-web-v2023.ts';
+import {
+  ajustarValorViaProxy,
+  AjustarValorProxyError,
+} from '../_shared/ajustar-valor-proxy.ts';
 
 interface RequestBody {
   licitacao_id?: string;
@@ -617,31 +620,43 @@ Deno.serve(async (req: Request) => {
     //
     // Opt-out: body.pular_forcar_total_edital=true.
     if (!isProposta && body.forcar_total_inline === true) {
-      // AUTO-AJUSTE DESABILITADO POR DEFAULT (jun/2026).
+      // AUTO-AJUSTE opt-in (default false desde jun/2026).
       //
-      // Motivo: chamar ajustarValor logo após addItemsBatch tem chance
-      // de CORROMPER o budget (visto em SEINFRA PI, vários outros — 500
-      // ao abrir). Causa raiz ainda em investigação.
-      //
-      // Solução atual: cadastro CRIA o budget intacto, deixa o total
-      // como veio da soma dos items, e o orçamentista usa o botão
-      // "Forçar total" do OrçaPav AI quando precisar ajustar. Mais
-      // cliques mas budget sempre acessível.
-      //
-      // Pra reativar, o cliente manda body.forcar_total_inline=true.
+      // IMPORTANTE (jul/2026): NÃO chama mais ajustarValor() direto (HTTP
+      // puro) — corrompia o budget (visto em SEINFRA PI e outros, 500 ao
+      // abrir). Delega pra ajustarValorViaProxy (automação de navegador via
+      // Cláudio Proxy, ver _shared/ajustar-valor-proxy.ts). Se o proxy não
+      // estiver configurado (ou a automação falhar), cai no mesmo warning
+      // de antes pedindo pra usar "Forçar total" no OrçaPav AI — nunca
+      // arrisca corromper o budget.
       const totalExtraido = (comps ?? [])
         .filter((c) => c.tipo_linha === 'servico')
         .reduce((s, c) => s + (Number(c.preco_total) || 0), 0);
       if (totalExtraido > 0) {
         try {
           await new Promise((r) => setTimeout(r, 3000));
-          await ajustarValor(ctx, budget_id, totalExtraido);
-          warnings.push(
-            `✓ Auto-ajuste do total: orçamento forçado pra R$ ${totalExtraido.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`,
-          );
+          const ajusteResult = await ajustarValorViaProxy(admin, session, {
+            budgetId: budget_id,
+            valorFinal: totalExtraido,
+            callerUserId: user.id,
+            licitacaoId,
+            traceId,
+          });
+          if (ajusteResult.ok) {
+            warnings.push(
+              `✓ Auto-ajuste do total: orçamento forçado pra R$ ${totalExtraido.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`,
+            );
+          } else {
+            warnings.push(
+              `⚠ Auto-ajuste do total FALHOU (${(ajusteResult.error ?? 'erro desconhecido').slice(0, 150)}). Use "Forçar total" no OrçaPav AI.`,
+            );
+          }
         } catch (e) {
+          const msg = e instanceof AjustarValorProxyError
+            ? e.message
+            : (e instanceof Error ? e.message : String(e));
           warnings.push(
-            `⚠ Auto-ajuste do total FALHOU (${(e instanceof Error ? e.message : String(e)).slice(0, 150)}). Use "Forçar total" no OrçaPav AI.`,
+            `⚠ Auto-ajuste do total FALHOU (${msg.slice(0, 150)}). Use "Forçar total" no OrçaPav AI.`,
           );
         }
       }
