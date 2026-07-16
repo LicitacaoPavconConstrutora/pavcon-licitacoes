@@ -88,6 +88,8 @@ interface ComposicaoExtraida {
   unidade: string | null;
   tipo_linha: string;
   orcafascio_composition_id: string | null;
+  preco_unitario_sem_bdi: number | null;
+  preco_unitario_com_bdi: number | null;
 }
 
 interface ComposicaoPropriaItem {
@@ -162,7 +164,7 @@ Deno.serve(async (req: Request) => {
 
     const { data: composicoes, error: compErr } = await admin
       .from('composicoes_extraidas')
-      .select('id, item_codigo, codigo, fonte, descricao, unidade, tipo_linha, orcafascio_composition_id')
+      .select('id, item_codigo, codigo, fonte, descricao, unidade, tipo_linha, orcafascio_composition_id, preco_unitario_sem_bdi, preco_unitario_com_bdi')
       .eq('licitacao_id', licitacaoId)
       .eq('fonte', 'PROPRIA')
       .eq('tipo_linha', 'servico');
@@ -699,11 +701,6 @@ Deno.serve(async (req: Request) => {
       // Feedback do orçamentista (Batalha): "se em algum caso uma composição
       // própria não for encontrada nos anexos, criar a mesma no orçamento e
       // deixar em branco". É exatamente isso.
-      if (subs.length === 0) {
-        warnings.push(
-          `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}) criada em branco — não havia detalhamento no JSON do edital. Preencha manualmente os insumos/sub-composições no Orçafascio.`,
-        );
-      }
       // LIMITAÇÃO conhecida da API pública do Orçafascio: insumos do MyBase
       // (resources cadastrados pela empresa) NÃO podem ser sub-itens de outra
       // composição MyBase via /add-items (sempre devolve 500). Por isso os
@@ -711,6 +708,72 @@ Deno.serve(async (req: Request) => {
       // pra o orçamentista adicionar manualmente na UI web.
       const itemsParaApi: CompositionItem[] = [];
       const subItensManuais: string[] = [];
+
+      if (subs.length === 0) {
+        // FALLBACK (jul/2026): antes a composição ficava em branco (R$ 0,00)
+        // até alguém preencher manualmente — mesmo quando o PREÇO do item já
+        // tinha sido extraído certinho da planilha oficial do edital (só o
+        // DETALHAMENTO em sub-itens/insumos que faltava, geralmente porque a
+        // planilha auxiliar do órgão não veio na extração). Isso fazia o
+        // total do orçamento nunca bater com o edital.
+        //
+        // Reusa o MESMO mecanismo já testado em produção pras sub-composições
+        // PROPRIA auxiliares (ver "passo 4.5" acima, comentário "testes
+        // empíricos"): cria um Resource no MyBase com o preço JÁ CONHECIDO
+        // (não inventado — é o preco_unitario_sem_bdi extraído da planilha
+        // oficial) e adiciona como o único item da composição via
+        // type:'resource' (que funciona pela API — só composição-dentro-de-
+        // composição que 500a). O BDI é aplicado depois pelo orçamento, então
+        // usamos o preço SEM BDI aqui.
+        const precoConhecido = comp.preco_unitario_sem_bdi != null
+          ? Number(comp.preco_unitario_sem_bdi)
+          : comp.preco_unitario_com_bdi != null
+            ? Number(comp.preco_unitario_com_bdi)
+            : 0;
+        if (precoConhecido > 0) {
+          const fallbackCode = `FALLBACK_${codigo}`.slice(0, 50);
+          try {
+            let resource = await findMyBaseResourceByCode(ctx, fallbackCode);
+            if (!resource) {
+              resource = await createResource(ctx, {
+                group_id: grupo.id,
+                code: fallbackCode,
+                description: `${descricao} (preço do edital — sem detalhamento de insumos)`.slice(0, 500),
+                type: RESOURCE_TYPE.OUTROS,
+                unit: unidade,
+                local: uf,
+                pnd: precoConhecido,
+                pd: precoConhecido,
+                pndi: precoConhecido,
+                pdi: precoConhecido,
+                note:
+                  `Fallback automático: composição "${comp.item_codigo}" sem detalhamento no JSON do ` +
+                  'edital. Preço reproduzido de composicoes_extraidas.preco_unitario_sem_bdi (extraído ' +
+                  'da planilha oficial). Substitua por insumos reais quando/se a planilha auxiliar ' +
+                  'do órgão for localizada.',
+              });
+            }
+            itemsParaApi.push({ bank: 'MYBASE', code: resource.code, qty: 1, type: 'resource' });
+            warnings.push(
+              `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}): sem detalhamento no JSON do edital — ` +
+                `preenchida com o preço já extraído da planilha oficial (R$ ${precoConhecido.toFixed(2)}, sem BDI) ` +
+                'como item único. Substitua pelos insumos reais no Orçafascio quando localizar a planilha auxiliar do órgão.',
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            warnings.push(
+              `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}) criada em branco — falha ao aplicar ` +
+                `fallback de preço (${msg.slice(0, 150)}). Preencha manualmente os insumos no Orçafascio.`,
+            );
+          }
+        } else {
+          warnings.push(
+            `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}) criada em branco — não havia ` +
+              'detalhamento no JSON do edital nem preço extraído pra usar de fallback. Preencha manualmente ' +
+              'os insumos/sub-composições no Orçafascio.',
+          );
+        }
+      }
       // Cruzamento payload → sub_item original (pro fallback poder logar
       // descrição/preço quando o code falha)
       const itemPayloadToSub = new Map<string, ComposicaoPropriaItem>();
