@@ -181,15 +181,26 @@ interface CallGeminiOpts {
   traceId?: string;
 }
 
+// Status transitórios do lado do Google (sobrecarga/rate-limit) — vale a
+// pena tentar de novo. 400/401/403/404/etc são determinísticos: o mesmo
+// request malformado só ia falhar de novo, então NÃO entram aqui.
+const STATUS_RETRIAVEIS = new Set([429, 503]);
+const RETRY_DELAYS_MS = [5000, 15000]; // 2 tentativas extras (3 no total)
+
 /**
  * Chama generateContent no Gemini, audita a chamada e devolve o texto +
  * tokens usados + custo estimado. Lança GeminiError em status não-2xx.
+ *
+ * Retenta automaticamente em 429 (rate limit) e 503 (modelo sobrecarregado)
+ * — erros transitórios do lado do Google, sem relação com o conteúdo do
+ * request. Antes, um único 503 passageiro derrubava a extração inteira
+ * (visto em SINFRA 031/2026: 400 e 503 alternados nas tentativas manuais
+ * do orçamentista, sem nenhum retry automático).
  */
 export async function callGemini(
   opts: CallGeminiOpts,
 ): Promise<GeminiCallResult> {
   const url = `${GEMINI_API_BASE}/models/${opts.model}:generateContent?key=${opts.apiKey}`;
-  const startedAt = Date.now();
 
   const body = {
     contents: [
@@ -205,56 +216,75 @@ export async function callGemini(
     },
   };
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  const rawText = await response.text();
-  let parsed: unknown = null;
-  try {
-    parsed = rawText ? JSON.parse(rawText) : null;
-  } catch {
-    parsed = null;
-  }
-
   // Mascarar a API key na URL antes de logar
   const safeUrl = url.replace(/key=[^&]+/, 'key=***');
-  await logIntegration(opts.admin, {
-    user_id: opts.callerUserId,
-    licitacao_id: opts.licitacaoId ?? null,
-    provider: 'gemini',
-    endpoint: safeUrl,
-    metodo_http: 'POST',
-    request_payload: {
-      model: opts.model,
-      parts_summary: opts.parts.map((p) => {
-        if ('text' in p) return { type: 'text', length: p.text.length };
-        if ('inlineData' in p) {
-          return { type: 'inline', mime: p.inlineData.mimeType, bytes_b64: p.inlineData.data.length };
+
+  let response!: Response;
+  let rawText = '';
+  let parsed: unknown = null;
+  let startedAt = Date.now();
+
+  for (let tentativa = 0; tentativa <= RETRY_DELAYS_MS.length; tentativa++) {
+    startedAt = Date.now();
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    rawText = await response.text();
+    try {
+      parsed = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      parsed = null;
+    }
+
+    await logIntegration(opts.admin, {
+      user_id: opts.callerUserId,
+      licitacao_id: opts.licitacaoId ?? null,
+      provider: 'gemini',
+      endpoint: safeUrl,
+      metodo_http: 'POST',
+      request_payload: {
+        model: opts.model,
+        tentativa: tentativa + 1,
+        parts_summary: opts.parts.map((p) => {
+          if ('text' in p) return { type: 'text', length: p.text.length };
+          if ('inlineData' in p) {
+            return { type: 'inline', mime: p.inlineData.mimeType, bytes_b64: p.inlineData.data.length };
+          }
+          return { type: 'file', mime: p.fileData.mimeType, uri: p.fileData.fileUri };
+        }),
+        generationConfig: body.generationConfig,
+      },
+      response_status: response.status,
+      response_payload: parsed
+        ? {
+          candidates_summary:
+            (parsed as { candidates?: Array<{ finishReason?: string }> }).candidates
+              ?.map((c) => ({ finishReason: c.finishReason })) ?? null,
+          usageMetadata: (parsed as { usageMetadata?: GeminiUsage }).usageMetadata,
         }
-        return { type: 'file', mime: p.fileData.mimeType, uri: p.fileData.fileUri };
-      }),
-      generationConfig: body.generationConfig,
-    },
-    response_status: response.status,
-    response_payload: parsed
-      ? {
-        candidates_summary:
-          (parsed as { candidates?: Array<{ finishReason?: string }> }).candidates
-            ?.map((c) => ({ finishReason: c.finishReason })) ?? null,
-        usageMetadata: (parsed as { usageMetadata?: GeminiUsage }).usageMetadata,
-      }
-      : { raw: rawText.slice(0, 500) },
-    duracao_ms: Date.now() - startedAt,
-    custo_usd: parsed
-      ? estimateGeminiCost(
-        (parsed as { usageMetadata?: GeminiUsage }).usageMetadata ?? {},
-      )
-      : null,
-    trace_id: opts.traceId ?? null,
-  });
+        : { raw: rawText.slice(0, 500) },
+      duracao_ms: Date.now() - startedAt,
+      custo_usd: parsed
+        ? estimateGeminiCost(
+          (parsed as { usageMetadata?: GeminiUsage }).usageMetadata ?? {},
+        )
+        : null,
+      trace_id: opts.traceId ?? null,
+    });
+
+    if (response.ok) break;
+    const podeRetentar = STATUS_RETRIAVEIS.has(response.status) &&
+      tentativa < RETRY_DELAYS_MS.length;
+    if (!podeRetentar) break;
+    console.warn(
+      `[gemini] status ${response.status} (tentativa ${tentativa + 1}/${RETRY_DELAYS_MS.length + 1}) — ` +
+        `retentando em ${RETRY_DELAYS_MS[tentativa]}ms`,
+    );
+    await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[tentativa]));
+  }
 
   if (!response.ok) {
     throw new GeminiError(
