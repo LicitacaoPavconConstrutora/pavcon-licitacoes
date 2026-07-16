@@ -108,6 +108,19 @@ Deno.serve(async (req: Request) => {
     // Exigido: chamar o endpoint interno do Orçafascio direto via fetch já
     // corrompeu orçamentos reais 2x (ver comentário no topo do arquivo). Sem
     // o proxy configurado, recusamos em vez de arriscar.
+    // Kill-switch: sete FORCAR_TOTAL_AUTO_DESATIVADO=true (secret do Supabase)
+    // pra desligar essa function imediatamente, sem reverter/redeployar
+    // código. Espelha o mesmo flag checado no frontend (actions.ts) —
+    // checado aqui de novo como segunda camada, caso a function seja
+    // chamada direto sem passar pela tela.
+    if (Deno.env.get('FORCAR_TOTAL_AUTO_DESATIVADO') === 'true') {
+      return errorResponse(
+        503,
+        'Forçar total automático está desativado (FORCAR_TOTAL_AUTO_DESATIVADO=true). ' +
+          'Ajuste o valor manualmente no Orçafascio ("Editar → Ajustar valor").',
+      );
+    }
+
     const proxyUrl = Deno.env.get('CLAUDIO_PROXY_URL');
     const proxyToken = Deno.env.get('CLAUDIO_PROXY_TOKEN') ?? '';
     if (!proxyUrl) {

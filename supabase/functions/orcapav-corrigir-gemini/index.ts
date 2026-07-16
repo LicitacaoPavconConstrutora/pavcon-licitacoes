@@ -204,15 +204,12 @@ async function executarTool(
       .select('status, cadastro_resumo')
       .eq('id', licitacaoId)
       .maybeSingle();
-    const { data: codes } = await admin
-      .from('orcafascio_code_mappings')
-      .select('fonte_original, codigo_original, descricao')
-      .is('codigo_substituto', null);
+    const codes = await codesPendentesDaLicitacao(licitacaoId, admin);
     return {
       status: lic?.status,
       warnings_recentes:
         (lic?.cadastro_resumo as { warnings?: string[] } | null)?.warnings?.slice(0, 10) ?? [],
-      codes_pendentes: (codes ?? []).slice(0, 15),
+      codes_pendentes: codes.slice(0, 15),
     };
   }
 
@@ -221,6 +218,47 @@ async function executarTool(
   }
 
   return { ok: false, error: `Tool desconhecida: ${name}` };
+}
+
+// =============================================================================
+// Codes pendentes de mapeamento RELEVANTES pra essa licitação.
+// =============================================================================
+// BUG (jul/2026): antes essa função (e a tool obter_estado_atual) buscavam
+// `orcafascio_code_mappings` SEM filtrar por licitação — orcafascio_code_mappings
+// é uma tabela GLOBAL (reusada entre editais futuros, sem coluna licitacao_id),
+// então a query pegava "os 30 primeiros pendentes do sistema inteiro". Depois
+// de meses rodando várias licitações, os codes relevantes desta licitação
+// podiam nem entrar nesse corte — o Gemini respondia "nenhum código pendente"
+// mesmo quando ESTA licitação tinha pendências reais. Mesmo padrão de filtro
+// já usado em frontend/src/lib/agente/actions.ts (analisarLicitacao).
+async function codesPendentesDaLicitacao(
+  licitacaoId: string,
+  admin: ReturnType<typeof getServiceRoleClient>,
+): Promise<Array<{ fonte_original: string; codigo_original: string; descricao: string | null }>> {
+  const { data: proprias } = await admin
+    .from('composicoes_extraidas')
+    .select('id')
+    .eq('licitacao_id', licitacaoId)
+    .eq('fonte', 'PROPRIA');
+  const compIds = (proprias ?? []).map((c) => c.id);
+  if (compIds.length === 0) return [];
+
+  const { data: subitens } = await admin
+    .from('composicao_propria_itens')
+    .select('codigo, fonte')
+    .in('composicao_extraida_id', compIds);
+  const codesDaLicitacao = new Set(
+    (subitens ?? []).map((s) => `${(s.fonte ?? '').toUpperCase()}/${s.codigo ?? ''}`),
+  );
+  if (codesDaLicitacao.size === 0) return [];
+
+  const { data: pendentes } = await admin
+    .from('orcafascio_code_mappings')
+    .select('fonte_original, codigo_original, descricao')
+    .is('codigo_substituto', null);
+  return (pendentes ?? []).filter((m) =>
+    codesDaLicitacao.has(`${(m.fonte_original ?? '').toUpperCase()}/${m.codigo_original ?? ''}`),
+  );
 }
 
 // =============================================================================
@@ -238,11 +276,7 @@ async function coletarContexto(
 
   const warnings = (lic?.cadastro_resumo as { warnings?: string[] } | null)?.warnings ?? [];
 
-  // codes pendentes da tabela orcafascio_code_mappings
-  const { data: codesPend } = await admin
-    .from('orcafascio_code_mappings')
-    .select('fonte_original, codigo_original, descricao')
-    .is('codigo_substituto', null);
+  const codesPend = await codesPendentesDaLicitacao(licitacaoId, admin);
 
   // composições proprias da licitação (pra detectar -ADAP)
   const { data: comps } = await admin
@@ -254,7 +288,7 @@ async function coletarContexto(
   return {
     licitacao: { id: lic?.id, titulo: lic?.titulo, status: lic?.status },
     warnings_passo1: warnings.slice(0, 25),
-    codes_pendentes_mapeamento: (codesPend ?? []).slice(0, 30),
+    codes_pendentes_mapeamento: codesPend.slice(0, 30),
     composicoes_amostra: (comps ?? []).slice(0, 20),
   };
 }

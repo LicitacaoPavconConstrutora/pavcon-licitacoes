@@ -138,7 +138,15 @@ export async function analisarLicitacao(
     // que é SEPARADO dos secrets do Supabase — precisa configurar a mesma
     // variável nos dois lugares (Vercel env vars + `supabase secrets set`),
     // senão o botão nem aparece mesmo com o proxy configurado no Supabase.
-    claudioProxyDisponivel: !!process.env.CLAUDIO_PROXY_URL,
+    //
+    // KILL-SWITCH: se a automação de navegador se comportar mal em produção,
+    // sete FORCAR_TOTAL_AUTO_DESATIVADO=true (só no Vercel) pra voltar
+    // IMEDIATAMENTE ao aviso manual de antes ("Editar → Ajustar valor" no
+    // Orçafascio), sem precisar desconfigurar o proxy inteiro (que o chat
+    // também usa) nem reverter/redeployar código.
+    claudioProxyDisponivel:
+      !!process.env.CLAUDIO_PROXY_URL &&
+      process.env.FORCAR_TOTAL_AUTO_DESATIVADO !== 'true',
   };
 
   // 2) Roda detectores
