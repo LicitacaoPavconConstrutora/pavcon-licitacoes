@@ -155,23 +155,30 @@ function detectarDataBaseGenerica(ctx: ContextoAnalise): Diagnostico[] {
       },
     }];
   }
-  // Quando descrição menciona só 1 banco mas o edital usa múltiplos, alerta
-  const bases = ctx.cabecalho?.bases_utilizadas ?? [];
+  // Quando descrição menciona só 1 banco mas o edital usa múltiplos, avisa —
+  // só INFORMATIVO: seguimos a data-base exatamente como o órgão declarou no
+  // edital, sem inventar/completar nada. "PROPRIA" nunca entra nessa
+  // comparação — não é banco de referência externo, não tem "data-base"
+  // própria, e sempre ia gerar falso positivo (o edital declara UMA data-base
+  // pros bancos de referência; composições próprias não precisam ser citadas).
+  const bases = (ctx.cabecalho?.bases_utilizadas ?? []).filter(
+    (b) => b.toUpperCase() !== 'PROPRIA',
+  );
   const bancosMencionados = bases.filter((b) =>
     new RegExp(b, 'i').test(desc),
   );
   if (bases.length > 1 && bancosMencionados.length < bases.length) {
     return [{
       tipo: 'data_base_incompleta',
-      severidade: 'aviso',
-      titulo: 'data_base_descricao não menciona todos os bancos',
+      severidade: 'info',
+      titulo: 'data_base_descricao cita só parte dos bancos — segue o edital como está',
       mensagem:
-        `Edital usa ${bases.join('+')} mas a descrição só menciona ${
+        `Edital usa ${bases.join('+')} mas a descrição só cita ${
           bancosMencionados.join('+') || 'nenhum'
-        }. ` +
-        'Outros bancos usarão a mesma data — pode dar incompatibilidade com os codes.',
-      sugestao:
-        'Ideal: "SINAPI PI 02/2026, SEINFRA CE 28, ORSE SE 01/2026" (cada banco com sua data e UF).',
+        } explicitamente. Isso é esperado quando o órgão declara uma única ` +
+        'data-base pro edital inteiro — os demais bancos usam essa mesma data, ' +
+        'exatamente como está no documento oficial. Nenhuma correção necessária.',
+      contexto: { bases_referencia: bases, data_base_descricao: desc },
     }];
   }
   return [];
