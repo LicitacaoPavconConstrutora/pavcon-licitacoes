@@ -22,6 +22,7 @@ import { setTimeout as delay } from 'timers/promises';
 import { mkdtemp, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { ajustarValorViaBrowser } from './ajustar-valor.js';
 
 const PORT = process.env.PORT || 3001;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
@@ -235,6 +236,56 @@ app.post('/extract', async (req, res) => {
 });
 
 // =============================================================================
+// POST /ajustar-valor — "Forçar total" via automação de navegador (Playwright)
+// =============================================================================
+// Body:
+//   {
+//     "budget_id": "24 hex chars do orçamento no Orçafascio",
+//     "valor_final": 1300162.01,
+//     "cookie_header": "sessão já autenticada (session.cookie_header)",
+//     "dry_run": false   // true = preenche mas não submete (validação visual)
+//   }
+//
+// Existe pq a chamada HTTP direta ao endpoint interno do Orçafascio já
+// corrompeu orçamentos reais 2x (ver supabase/functions/_shared/
+// orcafascio-web-v2023.ts). Esta versão abre um Chromium de verdade e
+// clica/preenche o formulário real — não adivinha o "recipe" da API.
+//
+// NÃO TESTADO CONTRA O SITE REAL — rode com dry_run:true num orçamento de
+// TESTE primeiro e confira os screenshots (base64 PNG) na resposta antes
+// de confiar em dry_run:false num orçamento real. Vide comentários em
+// ajustar-valor.js pra como ajustar os seletores se algo não bater.
+// =============================================================================
+app.post('/ajustar-valor', async (req, res) => {
+  const { budget_id, valor_final, cookie_header, dry_run } = req.body || {};
+  if (!budget_id) return res.status(400).json({ error: 'budget_id obrigatório.' });
+  if (!Number.isFinite(valor_final) || valor_final <= 0) {
+    return res.status(400).json({ error: `valor_final inválido: ${valor_final}` });
+  }
+  if (!cookie_header) return res.status(400).json({ error: 'cookie_header obrigatório.' });
+
+  console.log(`[claudio-proxy] /ajustar-valor budget=${budget_id} valor=${valor_final} dry_run=${!!dry_run}`);
+  const startedAt = Date.now();
+  try {
+    const resultado = await ajustarValorViaBrowser({
+      budgetId: budget_id,
+      valorFinal: valor_final,
+      cookieHeader: cookie_header,
+      dryRun: !!dry_run,
+    });
+    console.log(`[claudio-proxy] /ajustar-valor ${resultado.ok ? 'OK' : 'FALHOU'} em ${Date.now() - startedAt}ms — passos: ${(resultado.passos ?? []).join(', ')}`);
+    res.json({ ...resultado, duration_ms: Date.now() - startedAt });
+  } catch (e) {
+    console.error('[claudio-proxy] /ajustar-valor erro:', e);
+    res.status(500).json({
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+      duration_ms: Date.now() - startedAt,
+    });
+  }
+});
+
+// =============================================================================
 // Notifica callback_url quando job termina (substitui polling)
 // =============================================================================
 async function notifyCallback(jobId, job) {
@@ -350,9 +401,10 @@ app.listen(PORT, () => {
   console.log(`║  CLI:   ${CLAUDE_BIN.padEnd(50)}║`);
   console.log(`║  Auth:  ${(AUTH_TOKEN ? 'token configurado' : 'desativada (modo dev)').padEnd(50)}║`);
   console.log('╠════════════════════════════════════════════════════════════╣');
-  console.log('║  Healthcheck: http://localhost:' + PORT + '/health                  ║');
-  console.log('║  Chat:        POST http://localhost:' + PORT + '/chat              ║');
-  console.log('║  Extract:     POST http://localhost:' + PORT + '/extract           ║');
+  console.log('║  Healthcheck:   http://localhost:' + PORT + '/health                ║');
+  console.log('║  Chat:          POST http://localhost:' + PORT + '/chat            ║');
+  console.log('║  Extract:       POST http://localhost:' + PORT + '/extract         ║');
+  console.log('║  Ajustar valor: POST http://localhost:' + PORT + '/ajustar-valor   ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log('Próximo passo: expor publicamente via Cloudflare Tunnel.');

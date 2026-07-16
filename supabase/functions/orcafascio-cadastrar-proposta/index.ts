@@ -31,11 +31,14 @@ import {
   OrcafascioWebError,
 } from '../_shared/orcafascio-web.ts';
 import {
-  ajustarValor,
   copyBudget,
   createContext,
   OrcafascioV2023Error,
 } from '../_shared/orcafascio-web-v2023.ts';
+import {
+  ajustarValorViaProxy,
+  AjustarValorProxyError,
+} from '../_shared/ajustar-valor-proxy.ts';
 
 interface RequestBody {
   licitacao_id?: string;
@@ -173,23 +176,50 @@ Deno.serve(async (req: Request) => {
     // MO (calculado no backend), o resultado total bate, embora a divisão
     // interna fique linear.
     //
-    // BUG conhecido (jun/2026): ajustarValor às vezes corrompe internamente
-    // o budget e a UI do Orçafascio retorna 500 ao abrir. Quando o user
-    // escolhe skip_ajustar_valor=true, pulamos esta chamada — budget fica
-    // com o valor TOTAL do base, e o user ajusta manualmente.
+    // IMPORTANTE (jul/2026): NÃO chama mais ajustarValor() (chamada HTTP
+    // direta) — corrompia o budget internamente (500 ao abrir depois).
+    // Delega pra ajustarValorViaProxy (automação de navegador via Cláudio
+    // Proxy, ver _shared/ajustar-valor-proxy.ts), que clica no formulário
+    // real do Orçafascio em vez de adivinhar a chamada da API. Se o proxy
+    // não estiver configurado (ou a automação falhar), cai no mesmo
+    // comportamento de skip_ajustar_valor=true: budget fica com o valor do
+    // base e o warning avisa pra ajustar manualmente — nunca arrisca
+    // corromper o budget.
     if (body.skip_ajustar_valor === true) {
       warnings.push(
         `ajustarValor PULADO (skip_ajustar_valor=true). Orçamento copiado ` +
         `com valor do base. Aplique o desconto manualmente no Orçafascio ` +
-        `usando "Ajustar valor" da UI (mais confiável que via API).`,
+        `usando "Ajustar valor" da UI.`,
       );
     } else {
-    try {
-      await ajustarValor(ctx, novoBudgetId, valorProposta);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      warnings.push(`ajustarValor falhou: ${msg.slice(0, 200)} — orçamento copiado mas sem desconto aplicado`);
-    }
+      try {
+        const ajusteResult = await ajustarValorViaProxy(admin, session, {
+          budgetId: novoBudgetId,
+          valorFinal: valorProposta,
+          callerUserId: user.id,
+          licitacaoId,
+          traceId,
+        });
+        if (!ajusteResult.ok) {
+          warnings.push(
+            `Ajustar valor falhou: ${ajusteResult.error ?? 'erro desconhecido'} — orçamento copiado mas sem ` +
+            'desconto aplicado. Ajuste manualmente no Orçafascio usando "Ajustar valor" da UI.',
+          );
+        } else if (ajusteResult.aviso) {
+          warnings.push(`Ajustar valor: ${ajusteResult.aviso}`);
+        }
+      } catch (e) {
+        // AjustarValorProxyError (proxy não configurado/desativado/sessão
+        // morta) ou qualquer outro erro inesperado — nunca deixa travar o
+        // cadastro da proposta, só avisa pra ajustar manualmente.
+        const msg = e instanceof AjustarValorProxyError
+          ? e.message
+          : (e instanceof Error ? e.message : String(e));
+        warnings.push(
+          `Ajustar valor não aplicado: ${msg.slice(0, 200)} — orçamento copiado mas sem desconto aplicado. ` +
+          'Ajuste manualmente no Orçafascio usando "Ajustar valor" da UI.',
+        );
+      }
     } // fim do if (skip_ajustar_valor)
 
     // ---- 5.5) Verificação pós-cadastro: confirma que o orçamento existe ----

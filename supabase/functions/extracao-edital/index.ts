@@ -871,12 +871,25 @@ Deno.serve(async (req: Request) => {
         console.log(`[extracao-edital][bg] OK extracao=${extracaoId} itens=${parsed.itens.length} duracao_ms=${duracaoMs}`);
       } catch (err) {
         // Background falhou — atualiza DB pro cliente ver via polling.
+        //
+        // IMPORTANTE: antes só gravava err.message ("Gemini respondeu 400."),
+        // que é só o status HTTP — o MOTIVO real (payload grande demais,
+        // parâmetro inválido, conteúdo bloqueado por safety, etc) vive em
+        // err.details e nunca chegava no banco, só no console.error da Edge
+        // Function (inacessível pro orçamentista). Agora anexa os detalhes
+        // (truncados) no erro_detalhe pra dar pra diagnosticar sem precisar
+        // de acesso aos logs do Supabase.
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[extracao-edital][bg] FALHOU extracao=${extracaoId}: ${msg}`);
+        const details = err instanceof GeminiError ? err.details : null;
+        const detailsStr = details
+          ? (typeof details === 'string' ? details : JSON.stringify(details)).slice(0, 1500)
+          : null;
+        const erroCompleto = detailsStr ? `${msg} — detalhes: ${detailsStr}` : msg;
+        console.error(`[extracao-edital][bg] FALHOU extracao=${extracaoId}: ${erroCompleto}`);
         if (extracaoId) {
           await admin.from('extracoes_ocr').update({
             status: 'falha',
-            erro_detalhe: msg,
+            erro_detalhe: erroCompleto,
             concluido_em: new Date().toISOString(),
           }).eq('id', extracaoId);
         }

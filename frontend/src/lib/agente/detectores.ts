@@ -45,6 +45,10 @@ export interface ContextoAnalise {
   totalExtraidoServicos?: number;
   /** Total atual do orçamento no Orçafascio (lido via API ou cache). */
   totalOrcamentoOrcafascio?: number | null;
+  /** CLAUDIO_PROXY_URL configurado no servidor — habilita "forçar total" via
+   * automação de navegador (Playwright), a única forma segura de aplicar o
+   * ajuste hoje (a chamada HTTP direta corrompe orçamentos — ver detector 8). */
+  claudioProxyDisponivel?: boolean;
   cabecalho: {
     uf?: string;
     bdi_percentual?: number | string;
@@ -151,23 +155,30 @@ function detectarDataBaseGenerica(ctx: ContextoAnalise): Diagnostico[] {
       },
     }];
   }
-  // Quando descrição menciona só 1 banco mas o edital usa múltiplos, alerta
-  const bases = ctx.cabecalho?.bases_utilizadas ?? [];
+  // Quando descrição menciona só 1 banco mas o edital usa múltiplos, avisa —
+  // só INFORMATIVO: seguimos a data-base exatamente como o órgão declarou no
+  // edital, sem inventar/completar nada. "PROPRIA" nunca entra nessa
+  // comparação — não é banco de referência externo, não tem "data-base"
+  // própria, e sempre ia gerar falso positivo (o edital declara UMA data-base
+  // pros bancos de referência; composições próprias não precisam ser citadas).
+  const bases = (ctx.cabecalho?.bases_utilizadas ?? []).filter(
+    (b) => b.toUpperCase() !== 'PROPRIA',
+  );
   const bancosMencionados = bases.filter((b) =>
     new RegExp(b, 'i').test(desc),
   );
   if (bases.length > 1 && bancosMencionados.length < bases.length) {
     return [{
       tipo: 'data_base_incompleta',
-      severidade: 'aviso',
-      titulo: 'data_base_descricao não menciona todos os bancos',
+      severidade: 'info',
+      titulo: 'data_base_descricao cita só parte dos bancos — segue o edital como está',
       mensagem:
-        `Edital usa ${bases.join('+')} mas a descrição só menciona ${
+        `Edital usa ${bases.join('+')} mas a descrição só cita ${
           bancosMencionados.join('+') || 'nenhum'
-        }. ` +
-        'Outros bancos usarão a mesma data — pode dar incompatibilidade com os codes.',
-      sugestao:
-        'Ideal: "SINAPI PI 02/2026, SEINFRA CE 28, ORSE SE 01/2026" (cada banco com sua data e UF).',
+        } explicitamente. Isso é esperado quando o órgão declara uma única ` +
+        'data-base pro edital inteiro — os demais bancos usam essa mesma data, ' +
+        'exatamente como está no documento oficial. Nenhuma correção necessária.',
+      contexto: { bases_referencia: bases, data_base_descricao: desc },
     }];
   }
   return [];
@@ -331,19 +342,16 @@ function detectarServicosSemFonte(ctx: ContextoAnalise): Diagnostico[] {
 // "forçar total" via ajustarValor — fix pragmático enquanto a re-extração
 // completa não roda.
 function detectarOrcamentoAbaixoDoEdital(ctx: ContextoAnalise): Diagnostico[] {
-  // DESABILITADO (jun/2026): a ação "Forçar total" chama ajustarValor que
-  // CORROMPE o budget no Orçafascio (visto consistentemente em SEFIR 02,
-  // SEINFRA, SEGOV — budget vira 500 ao abrir depois da chamada). Causa
-  // raiz é endpoint /ajustar_valor_passo_2 — chamar sozinho às vezes
-  // funciona, às vezes corrompe; mas o risco não vale a pena.
+  // HISTÓRICO (jun/2026): a ação "Forçar total" chamava ajustarValor via HTTP
+  // direto, que CORROMPEU o budget no Orçafascio duas vezes (visto em SEFIR
+  // 02, SEINFRA, SEGOV — budget virava 500 ao abrir). Causa raiz: as duas
+  // tentativas adivinhavam a sequência de campos/URLs do endpoint interno em
+  // vez de reproduzir o que o navegador real faz.
   //
-  // Substituto: orçamentista deve ajustar valor MANUALMENTE pela interface
-  // do Orçafascio (Editar > Ajustar valor). A UI deles faz o sequenciamento
-  // certo (passo_1 carrega o form, passo_2 confirma) que nossa API não
-  // consegue replicar via HTTP direto.
-  //
-  // Quando descobrirmos como replicar o sequenciamento, reativar este
-  // detector retornando o diagnóstico com acao_acionavel forcar_total_inline.
+  // jul/2026: reativado COM ação, mas só quando `claudioProxyDisponivel` —
+  // nesse caso a ação roda via automação de navegador (Playwright, no
+  // Cláudio Proxy) que clica no formulário real em vez de adivinhar a API.
+  // Sem o proxy configurado, continua só o aviso manual de antes.
   if (!ctx.licitacao.orcafascio_orcamento_base_id) return [];
   const totalExtraido = ctx.totalExtraidoServicos ?? 0;
   if (totalExtraido <= 0) return [];
@@ -351,16 +359,39 @@ function detectarOrcamentoAbaixoDoEdital(ctx: ContextoAnalise): Diagnostico[] {
   if (!temComposVazias) return [];
   const moeda = (n: number) =>
     n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-  // Devolve um AVISO sem ação clicável — só informa pro orçamentista
-  // que ele precisa ajustar manualmente no Orçafascio.
+
+  if (ctx.claudioProxyDisponivel) {
+    return [{
+      tipo: 'orcamento_abaixo_do_edital_auto',
+      severidade: 'aviso',
+      titulo: `Total deve ser ${moeda(totalExtraido)} — abaixo do edital no Orçafascio`,
+      mensagem:
+        `${ctx.composicoesVazias?.length ?? 0} composição(ões) em branco contribuem R$ 0,00 ` +
+        `— total do Orçafascio fica abaixo do edital.`,
+      sugestao:
+        `Clique pra ajustar via Cláudio Proxy (automação de navegador — clica no formulário ` +
+        `real do Orçafascio, não usa mais a API que corrompia orçamentos). ` +
+        `Primeira vez usando essa ação numa licitação real: confira o orçamento no Orçafascio ` +
+        `depois pra confirmar que aplicou certo.`,
+      acao_acionavel: {
+        tipo: 'forcar_total_inline',
+        params: { valor_alvo: totalExtraido },
+        label: '💰 Forçar total agora (via navegador)',
+      },
+      contexto: { total_extraido: totalExtraido },
+    }];
+  }
+
+  // Sem proxy configurado: mantém só o aviso manual (comportamento anterior).
   return [{
     tipo: 'orcamento_abaixo_do_edital_manual',
     severidade: 'aviso',
     titulo: `Total deve ser ${moeda(totalExtraido)} — ajustar MANUAL no Orçafascio`,
     mensagem:
       `${ctx.composicoesVazias?.length ?? 0} composição(ões) em branco contribuem R$ 0,00 ` +
-      `— total do Orçafascio fica abaixo do edital. NÃO use Forçar Total automático ` +
-      `(API ajustarValor do Orçafascio corrompe budgets — bug deles).`,
+      `— total do Orçafascio fica abaixo do edital. NÃO use a API ajustarValor direto ` +
+      `(corrompe budgets — bug deles). Configure o Cláudio Proxy (claudio-proxy/) pra ` +
+      `habilitar o ajuste automático via navegador.`,
     sugestao:
       `Abre o orçamento no Orçafascio, vai em "Editar → Ajustar valor", ` +
       `cola ${moeda(totalExtraido)} e confirma. A UI deles aplica certinho.`,

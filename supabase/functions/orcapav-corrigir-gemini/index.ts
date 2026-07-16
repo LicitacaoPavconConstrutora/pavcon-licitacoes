@@ -21,6 +21,7 @@
 import { handleCorsPreflight } from '../_shared/cors.ts';
 import { errorResponse, jsonResponse } from '../_shared/json.ts';
 import { getServiceRoleClient, requireAuthenticatedUser } from '../_shared/supabase.ts';
+import { codesPendentesDaLicitacao } from '../_shared/codes-pendentes.ts';
 
 const GEMINI_FLASH = 'gemini-2.5-flash';
 const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta';
@@ -204,15 +205,12 @@ async function executarTool(
       .select('status, cadastro_resumo')
       .eq('id', licitacaoId)
       .maybeSingle();
-    const { data: codes } = await admin
-      .from('orcafascio_code_mappings')
-      .select('fonte_original, codigo_original, descricao')
-      .is('codigo_substituto', null);
+    const codes = await codesPendentesDaLicitacao(admin, licitacaoId);
     return {
       status: lic?.status,
       warnings_recentes:
         (lic?.cadastro_resumo as { warnings?: string[] } | null)?.warnings?.slice(0, 10) ?? [],
-      codes_pendentes: (codes ?? []).slice(0, 15),
+      codes_pendentes: codes.slice(0, 15),
     };
   }
 
@@ -222,6 +220,10 @@ async function executarTool(
 
   return { ok: false, error: `Tool desconhecida: ${name}` };
 }
+
+// codesPendentesDaLicitacao agora vem de ../_shared/codes-pendentes.ts —
+// ver esse arquivo pro histórico do bug de escopo (jul/2026) e pra evitar
+// uma 4ª cópia divergente desta mesma lógica.
 
 // =============================================================================
 // Coleta inicial do contexto pra mandar pro Gemini
@@ -238,11 +240,7 @@ async function coletarContexto(
 
   const warnings = (lic?.cadastro_resumo as { warnings?: string[] } | null)?.warnings ?? [];
 
-  // codes pendentes da tabela orcafascio_code_mappings
-  const { data: codesPend } = await admin
-    .from('orcafascio_code_mappings')
-    .select('fonte_original, codigo_original, descricao')
-    .is('codigo_substituto', null);
+  const codesPend = await codesPendentesDaLicitacao(admin, licitacaoId);
 
   // composições proprias da licitação (pra detectar -ADAP)
   const { data: comps } = await admin
@@ -254,7 +252,7 @@ async function coletarContexto(
   return {
     licitacao: { id: lic?.id, titulo: lic?.titulo, status: lic?.status },
     warnings_passo1: warnings.slice(0, 25),
-    codes_pendentes_mapeamento: (codesPend ?? []).slice(0, 30),
+    codes_pendentes_mapeamento: codesPend.slice(0, 30),
     composicoes_amostra: (comps ?? []).slice(0, 20),
   };
 }
