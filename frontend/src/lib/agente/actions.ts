@@ -35,7 +35,7 @@ export async function analisarLicitacao(
 
   const { data: extracao } = await admin
     .from('extracoes_ocr')
-    .select('json_corrigido, json_extraido')
+    .select('json_corrigido, json_extraido, conferencia_resultado')
     .eq('licitacao_id', licitacaoId)
     .in('status', ['sucesso', 'revisada_humano'])
     .order('created_at', { ascending: false })
@@ -43,6 +43,8 @@ export async function analisarLicitacao(
     .maybeSingle();
   const cabecalho = ((extracao?.json_corrigido ?? extracao?.json_extraido) as
     { cabecalho?: ContextoAnalise['cabecalho'] } | null)?.cabecalho ?? null;
+  const conferenciaResultado =
+    (extracao?.conferencia_resultado as ContextoAnalise['conferenciaResultado']) ?? null;
 
   const { data: servicos } = await admin
     .from('composicoes_extraidas')
@@ -131,6 +133,7 @@ export async function analisarLicitacao(
     composicoesVazias,
     totalExtraidoServicos,
     totalOrcamentoOrcafascio,
+    conferenciaResultado,
   };
 
   // 2) Roda detectores
