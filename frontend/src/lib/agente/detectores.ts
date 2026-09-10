@@ -71,6 +71,22 @@ export interface ContextoAnalise {
     codigo: string | null;
     descricao: string;
   }>;
+  // Resultado da 2ª passada de conferência (auditoria automática pós-extração
+  // via Gemini Flash, ver supabase/functions/extracao-edital/conferencia-prompt.ts).
+  // null quando a extração é antiga (rodou antes dessa etapa existir) ou a
+  // conferência falhou silenciosamente.
+  conferenciaResultado?: {
+    itens_verificados: number;
+    divergencias: Array<{
+      item_codigo: string;
+      tipo: 'invencao' | 'fora_de_ordem' | 'valor_divergente' | 'descricao_divergente' | 'item_faltando';
+      detalhe: string;
+    }>;
+    // Preenchido quando a conferência falhou (a function grava o erro pra o
+    // painel poder dizer "não auditado" em vez de ficar silencioso).
+    erro?: string;
+    versao?: string;
+  } | null;
 }
 
 // =============================================================================
@@ -331,19 +347,19 @@ function detectarServicosSemFonte(ctx: ContextoAnalise): Diagnostico[] {
 // "forçar total" via ajustarValor — fix pragmático enquanto a re-extração
 // completa não roda.
 function detectarOrcamentoAbaixoDoEdital(ctx: ContextoAnalise): Diagnostico[] {
-  // DESABILITADO (jun/2026): a ação "Forçar total" chama ajustarValor que
-  // CORROMPE o budget no Orçafascio (visto consistentemente em SEFIR 02,
-  // SEINFRA, SEGOV — budget vira 500 ao abrir depois da chamada). Causa
-  // raiz é endpoint /ajustar_valor_passo_2 — chamar sozinho às vezes
-  // funciona, às vezes corrompe; mas o risco não vale a pena.
+  // REATIVADO (set/2026) A PEDIDO EXPLÍCITO DO CLIENTE, CIENTE DO RISCO:
+  // entre jun/2026 e set/2026 esse detector ficou sem acao_acionavel porque
+  // "Forçar total" chama ajustarValor, que já CORROMPEU orçamentos reais
+  // (SEFIR 02, SEINFRA, SEGOV — budget vira 500 ao abrir depois da chamada).
+  // Causa raiz nunca identificada (é bug do backend do Orçafascio, fora do
+  // nosso controle) — nem a versão "simples" (só POST passo_2) se provou
+  // livre do problema depois. O usuário foi avisado do histórico completo
+  // (3 incidentes documentados, sem correção conhecida) e pediu reativação
+  // mesmo assim, pra rodar sem clique manual dentro de "IA corrige TUDO".
   //
-  // Substituto: orçamentista deve ajustar valor MANUALMENTE pela interface
-  // do Orçafascio (Editar > Ajustar valor). A UI deles faz o sequenciamento
-  // certo (passo_1 carrega o form, passo_2 confirma) que nossa API não
-  // consegue replicar via HTTP direto.
-  //
-  // Quando descobrirmos como replicar o sequenciamento, reativar este
-  // detector retornando o diagnóstico com acao_acionavel forcar_total_inline.
+  // Se isso corromper outro orçamento: o fix de emergência é o commit
+  // 42f4d8d (revert: ajustarValor passo_1 + auto-ajuste no cadastro) — volta
+  // a tirar o acao_acionavel daqui e deixar só o aviso manual de novo.
   if (!ctx.licitacao.orcafascio_orcamento_base_id) return [];
   const totalExtraido = ctx.totalExtraidoServicos ?? 0;
   if (totalExtraido <= 0) return [];
@@ -351,20 +367,71 @@ function detectarOrcamentoAbaixoDoEdital(ctx: ContextoAnalise): Diagnostico[] {
   if (!temComposVazias) return [];
   const moeda = (n: number) =>
     n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-  // Devolve um AVISO sem ação clicável — só informa pro orçamentista
-  // que ele precisa ajustar manualmente no Orçafascio.
   return [{
     tipo: 'orcamento_abaixo_do_edital_manual',
     severidade: 'aviso',
-    titulo: `Total deve ser ${moeda(totalExtraido)} — ajustar MANUAL no Orçafascio`,
+    titulo: `Total deve ser ${moeda(totalExtraido)} — forçar no Orçafascio`,
     mensagem:
       `${ctx.composicoesVazias?.length ?? 0} composição(ões) em branco contribuem R$ 0,00 ` +
-      `— total do Orçafascio fica abaixo do edital. NÃO use Forçar Total automático ` +
-      `(API ajustarValor do Orçafascio corrompe budgets — bug deles).`,
+      `— total do Orçafascio fica abaixo do edital. Forçar Total automático usa a API ` +
+      `ajustarValor do Orçafascio, que JÁ CORROMPEU orçamentos reais antes (bug deles, sem ` +
+      `correção conhecida) — reativado a pedido do cliente, ciente do risco.`,
     sugestao:
-      `Abre o orçamento no Orçafascio, vai em "Editar → Ajustar valor", ` +
-      `cola ${moeda(totalExtraido)} e confirma. A UI deles aplica certinho.`,
+      `Se preferir evitar o risco, ajuste manualmente: abre o orçamento no Orçafascio, ` +
+      `"Editar → Ajustar valor", cola ${moeda(totalExtraido)} e confirma.`,
+    acao_acionavel: {
+      tipo: 'forcar_total_inline',
+      params: { valor_alvo: totalExtraido },
+      label: '⚠️ Forçar total agora',
+    },
     contexto: { total_extraido: totalExtraido },
+  }];
+}
+
+// =============================================================================
+// Detector 11: divergências da conferência automática (2ª passada)
+// =============================================================================
+// Compara os itens extraídos contra o PDF de forma independente (rodou logo
+// após a extração, na própria Edge Function). "invencao" e "item_faltando"
+// são erro (mudam o valor do orçamento); "fora_de_ordem" e "descricao/valor
+// divergente" são aviso (podem ser inofensivos, mas merecem checar).
+function detectarDivergenciasConferencia(ctx: ContextoAnalise): Diagnostico[] {
+  const conferencia = ctx.conferenciaResultado;
+  if (conferencia?.erro) {
+    return [{
+      tipo: 'conferencia_falhou',
+      severidade: 'aviso',
+      titulo: 'Conferência automática não rodou',
+      mensagem:
+        `A auditoria que compara os itens extraídos contra o PDF falhou: ${conferencia.erro}. ` +
+        `Isso não invalida a extração, mas ela ficou SEM checagem de itens inventados/fora de ordem.`,
+      sugestao: 'Confira a planilha manualmente contra o PDF antes de cadastrar, ou re-extraia.',
+    }];
+  }
+  const divergencias = conferencia?.divergencias ?? [];
+  if (divergencias.length === 0) return [];
+
+  const graves = divergencias.filter((d) => d.tipo === 'invencao' || d.tipo === 'item_faltando');
+  const severidade: Severidade = graves.length > 0 ? 'erro' : 'aviso';
+
+  const porTipo = new Map<string, number>();
+  for (const d of divergencias) porTipo.set(d.tipo, (porTipo.get(d.tipo) ?? 0) + 1);
+  const breakdown = Array.from(porTipo.entries()).map(([t, n]) => `${t} (${n})`).join(', ');
+
+  return [{
+    tipo: 'divergencias_conferencia',
+    severidade,
+    titulo: `${divergencias.length} divergência(s) na conferência automática`,
+    mensagem:
+      `A auditoria automática (2ª passada, independente da extração) encontrou: ${breakdown}. ` +
+      `Itens "invencao" ou "item_faltando" mudam o valor do orçamento — confira antes de cadastrar.`,
+    sugestao:
+      'Abra a tela de revisão da extração e confira cada item apontado contra o PDF original ' +
+      'antes de aprovar pro cadastro no Orçafascio.',
+    contexto: {
+      itens_verificados: ctx.conferenciaResultado?.itens_verificados ?? null,
+      divergencias: divergencias.slice(0, 15),
+    },
   }];
 }
 
@@ -382,6 +449,7 @@ export const DETECTORES: Array<(ctx: ContextoAnalise) => Diagnostico[]> = [
   detectarReclassificados,
   detectarServicosSemFonte,
   detectarOrcamentoAbaixoDoEdital,
+  detectarDivergenciasConferencia,
 ];
 
 export function rodarAnalise(ctx: ContextoAnalise): Diagnostico[] {

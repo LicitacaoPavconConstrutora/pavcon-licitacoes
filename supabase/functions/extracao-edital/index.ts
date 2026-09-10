@@ -31,7 +31,7 @@ import {
 // LLM_PROVIDER abaixo pra 'anthropic' + importar de '../_shared/anthropic.ts'.
 import { callGemini, GeminiError, type GeminiPart, type GeminiTurn } from '../_shared/gemini.ts';
 import { callClaude, type ClaudeContent } from '../_shared/anthropic.ts';
-import { PROMPT_VERSION, SYSTEM_PROMPT } from './prompt-v2.ts';
+import { PROMPT_VERSION, SYSTEM_PROMPT } from './prompt-v3.ts';
 
 // gemini-2.5-pro (definitivo). Tentamos 3.1-pro-preview duas vezes mas com
 // thinking mode ele estoura o cap de 400s do EdgeRuntime em PDFs reais —
@@ -252,26 +252,31 @@ Deno.serve(async (req: Request) => {
       claudioProxyUrl = Deno.env.get('CLAUDIO_PROXY_URL') ?? null;
       claudioProxyToken = Deno.env.get('CLAUDIO_PROXY_TOKEN') ?? null;
 
-      if (!claudioProxyUrl) {
-        // Fallback pra API key direta
-        const { data: aCreds, error: aCredsErr } = await admin
-          .from('api_credentials')
-          .select('id, vault_secret_id, ativo, escopo, owner_id')
-          .eq('provider', 'anthropic')
-          .eq('ativo', true)
-          .order('escopo', { ascending: true });
-        if (aCredsErr) {
-          return errorResponse(500, 'Falha ao listar credenciais Anthropic.', aCredsErr.message);
-        }
-        const aCred = aCreds?.find((c) =>
-          c.escopo === 'organizacional' || c.owner_id === user.id
+      // Resolve a API key SEMPRE que houver credencial, mesmo com proxy
+      // configurado. PADRÃO DETECTADO (set/2026): CLAUDIO_PROXY_URL aponta pra
+      // um Cloudflare Quick Tunnel, que é efêmero — quando a máquina do
+      // orçamentista muda, a URL vira DNS inexistente e toda extração com
+      // provider=anthropic morria com "dns error: failed to lookup address
+      // information". Sem a key resolvida aqui, não havia pra onde cair.
+      const { data: aCreds, error: aCredsErr } = await admin
+        .from('api_credentials')
+        .select('id, vault_secret_id, ativo, escopo, owner_id')
+        .eq('provider', 'anthropic')
+        .eq('ativo', true)
+        .order('escopo', { ascending: true });
+      if (aCredsErr) {
+        return errorResponse(500, 'Falha ao listar credenciais Anthropic.', aCredsErr.message);
+      }
+      const aCred = aCreds?.find((c) =>
+        c.escopo === 'organizacional' || c.owner_id === user.id
+      );
+      if (!claudioProxyUrl && !aCred) {
+        return errorResponse(
+          422,
+          'Sem CLAUDIO_PROXY_URL e sem credencial Anthropic ativa. Configure uma das duas.',
         );
-        if (!aCred) {
-          return errorResponse(
-            422,
-            'Sem CLAUDIO_PROXY_URL e sem credencial Anthropic ativa. Configure uma das duas.',
-          );
-        }
+      }
+      if (aCred) {
         const { data: aKey, error: aVaultErr } = await admin.rpc('read_vault_secret', {
           p_secret_id: aCred.vault_secret_id,
         });
@@ -401,10 +406,21 @@ Deno.serve(async (req: Request) => {
     // de parse/validação ser identico abaixo. Usage normalizado pra
     // {promptTokenCount, candidatesTokenCount} (formato Gemini histórico)
     // pra não precisar mexer no UPDATE de extracoes_ocr abaixo.
-    let resultText: string | null;
+    //
+    // CADEIA DE FALLBACK (set/2026): cada etapa só roda se a anterior não
+    // produziu texto. Antes era if/else-if: quando o proxy Cláudio estava
+    // configurado mas morto (túnel Cloudflare efêmero), a extração falhava
+    // inteira mesmo havendo API key Anthropic e Gemini disponíveis — o
+    // orçamentista só via "Erro na extração" e reclicava sem sair do lugar.
+    let resultText: string | null = null;
     let resultUsage = { promptTokenCount: 0, candidatesTokenCount: 0 };
     let resultCustoUsd = 0;
+    // Provider/modelo REALMENTE usados (a linha de extracoes_ocr foi criada com
+    // o escolhido; se cair pro fallback, corrigimos no update final).
+    let providerUsado: 'gemini' | 'anthropic' = providerEscolhido;
+    let modeloUsado = providerEscolhido === 'anthropic' ? CLAUDE_MODEL : GEMINI_MODEL;
     if (providerEscolhido === 'anthropic' && claudioProxyUrl) {
+      try {
       // Caminho A: proxy local (Claude Code CLI com sub Max). Usa fluxo
       // ASSÍNCRONO porque Cloudflare Quick Tunnel mata HTTP requests em 100s
       // e Claude CLI extrai em 3-8 min. Proxy responde com job_id na hora,
@@ -462,7 +478,19 @@ Deno.serve(async (req: Request) => {
       resultText = proxyText;
       resultUsage = { promptTokenCount: 0, candidatesTokenCount: 0 };
       resultCustoUsd = 0;
-    } else if (providerEscolhido === 'anthropic') {
+      } catch (proxyErr) {
+        // Túnel fora do ar (DNS/connect), job expirado ou timeout: não vale
+        // derrubar a extração se ainda há Claude API ou Gemini disponíveis.
+        const msg = proxyErr instanceof Error ? proxyErr.message : String(proxyErr);
+        console.error(`[extracao-edital] proxy Cláudio indisponível, caindo pro fallback: ${msg}`);
+        extracaoWarnings.push(
+          `Proxy Cláudio (CLAUDIO_PROXY_URL) indisponível: ${msg.slice(0, 200)}. ` +
+          `A extração seguiu pelo fallback — se o túnel da sua máquina não estiver mais no ar, ` +
+          `limpe a variável CLAUDIO_PROXY_URL nos secrets da Edge Function.`,
+        );
+      }
+    }
+    if (resultText === null && providerEscolhido === 'anthropic' && anthropicApiKey) {
       // Caminho B: Anthropic API direta (consome créditos console.anthropic.com)
       const claudeUserContent: ClaudeContent[] = [];
       if (introMultiArquivo) claudeUserContent.push({ type: 'text', text: introMultiArquivo });
@@ -494,7 +522,19 @@ Deno.serve(async (req: Request) => {
         candidatesTokenCount: r.usage.output_tokens ?? 0,
       };
       resultCustoUsd = r.estimatedCostUsd;
-    } else {
+      providerUsado = 'anthropic';
+      modeloUsado = CLAUDE_MODEL;
+    }
+    if (resultText === null) {
+      // Último recurso (e caminho normal quando provider='gemini').
+      if (providerEscolhido === 'anthropic') {
+        extracaoWarnings.push(
+          'Nenhum caminho Claude disponível (proxy fora do ar e sem API key utilizável) — ' +
+          'a extração foi feita com Gemini 2.5 Pro.',
+        );
+      }
+      providerUsado = 'gemini';
+      modeloUsado = GEMINI_MODEL;
       // Gemini: parts levam system prompt + intro + PDFs como inlineData.
       const initialParts: GeminiPart[] = [{ text: SYSTEM_PROMPT }];
       if (introMultiArquivo) initialParts.push({ text: introMultiArquivo });
@@ -844,6 +884,9 @@ Deno.serve(async (req: Request) => {
       .update({
         status: 'sucesso',
         json_extraido: { cabecalho: parsed.cabecalho, itens: parsed.itens },
+        // Pode divergir do escolhido quando a cadeia de fallback entrou em ação.
+        llm_provider: providerUsado,
+        llm_model: modeloUsado,
         tokens_input: result.usage.promptTokenCount ?? null,
         tokens_output: result.usage.candidatesTokenCount ?? null,
         custo_usd: result.estimatedCostUsd,
