@@ -82,6 +82,10 @@ export interface ContextoAnalise {
       tipo: 'invencao' | 'fora_de_ordem' | 'valor_divergente' | 'descricao_divergente' | 'item_faltando';
       detalhe: string;
     }>;
+    // Preenchido quando a conferência falhou (a function grava o erro pra o
+    // painel poder dizer "não auditado" em vez de ficar silencioso).
+    erro?: string;
+    versao?: string;
   } | null;
 }
 
@@ -392,7 +396,19 @@ function detectarOrcamentoAbaixoDoEdital(ctx: ContextoAnalise): Diagnostico[] {
 // são erro (mudam o valor do orçamento); "fora_de_ordem" e "descricao/valor
 // divergente" são aviso (podem ser inofensivos, mas merecem checar).
 function detectarDivergenciasConferencia(ctx: ContextoAnalise): Diagnostico[] {
-  const divergencias = ctx.conferenciaResultado?.divergencias ?? [];
+  const conferencia = ctx.conferenciaResultado;
+  if (conferencia?.erro) {
+    return [{
+      tipo: 'conferencia_falhou',
+      severidade: 'aviso',
+      titulo: 'Conferência automática não rodou',
+      mensagem:
+        `A auditoria que compara os itens extraídos contra o PDF falhou: ${conferencia.erro}. ` +
+        `Isso não invalida a extração, mas ela ficou SEM checagem de itens inventados/fora de ordem.`,
+      sugestao: 'Confira a planilha manualmente contra o PDF antes de cadastrar, ou re-extraia.',
+    }];
+  }
+  const divergencias = conferencia?.divergencias ?? [];
   if (divergencias.length === 0) return [];
 
   const graves = divergencias.filter((d) => d.tipo === 'invencao' || d.tipo === 'item_faltando');

@@ -32,11 +32,6 @@ import {
 import { callGemini, GeminiError, type GeminiPart, type GeminiTurn } from '../_shared/gemini.ts';
 import { callClaude, type ClaudeContent } from '../_shared/anthropic.ts';
 import { PROMPT_VERSION, SYSTEM_PROMPT } from './prompt-v3.ts';
-import {
-  CONFERENCIA_SYSTEM_PROMPT,
-  montarTabelaParaConferencia,
-  type ConferenciaResultado,
-} from './conferencia-prompt.ts';
 
 // gemini-2.5-pro (definitivo). Tentamos 3.1-pro-preview duas vezes mas com
 // thinking mode ele estoura o cap de 400s do EdgeRuntime em PDFs reais —
@@ -45,9 +40,6 @@ import {
 // pelas 3 camadas de recuperação (v8): JSON.parse direto + jsonrepair +
 // truncate-to-last-valid. Mais robusto pro pipeline atual.
 const GEMINI_MODEL = 'gemini-2.5-pro';
-// Modelo barato pra 2ª passada de conferência (auditoria pós-extração) —
-// mesmo usado em pdf-classificar-paginas e orcapav-corrigir-gemini.
-const GEMINI_FLASH_MODEL = 'gemini-2.5-flash';
 // Claude Sonnet 4.5 (snapshot 20250929, mesmo usado no claudio-chat).
 // Boa qualidade pra parsing de planilhas complexas, custo $3/$15 por M
 // tokens. Anthropic API exige ID com versão completa — nomes curtos
@@ -739,58 +731,6 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // ---- 5.7) Conferência independente (2ª passada, Gemini Flash) ----------
-    // PADRÃO DETECTADO (set/2026): mesmo com o prompt de extração proibindo
-    // invenção e reordenação, itens inventados/fora de ordem continuavam
-    // passando pro cadastro no Orçafascio. Um processo manual paralelo (2
-    // prompts separados: extrai, depois audita contra a fonte) não sofria
-    // desse problema. Replica a auditoria aqui: manda a tabela extraída +
-    // os PDFs originais pro Gemini Flash (barato) com a única tarefa de
-    // apontar divergências, sem re-extrair nada. Não fatal — se falhar, a
-    // extração segue normalmente, só sem o selo de auditoria.
-    let conferenciaResultado: ConferenciaResultado | null = null;
-    try {
-      const tabelaConferencia = montarTabelaParaConferencia(parsed.itens);
-      const confParts: GeminiPart[] = [
-        { text: CONFERENCIA_SYSTEM_PROMPT },
-        { text: `TABELA EXTRAÍDA (${parsed.itens.length} itens):\n${tabelaConferencia}` },
-      ];
-      for (const pdf of pdfsBase64) {
-        confParts.push({ inlineData: { mimeType: 'application/pdf', data: pdf.b64 } });
-      }
-      const confResp = await callGemini({
-        model: GEMINI_FLASH_MODEL,
-        apiKey,
-        parts: confParts,
-        responseJson: true,
-        temperature: 0,
-        maxOutputTokens: 8192,
-        admin,
-        callerUserId: user.id,
-        licitacaoId,
-        traceId,
-      });
-      const { obj: confObj } = await tentarParse(confResp.text ?? '');
-      const confParsed = confObj as Partial<ConferenciaResultado>;
-      if (Array.isArray(confParsed.divergencias)) {
-        conferenciaResultado = {
-          itens_verificados: confParsed.itens_verificados ?? parsed.itens.length,
-          divergencias: confParsed.divergencias,
-        };
-        if (conferenciaResultado.divergencias.length > 0) {
-          extracaoWarnings.push(
-            `Conferência automática encontrou ${conferenciaResultado.divergencias.length} ` +
-            `divergência(s) entre o extraído e o PDF (${[...new Set(conferenciaResultado.divergencias.map((d) => d.tipo))].join(', ')}). ` +
-            `Revise antes de cadastrar no Orçafascio.`,
-          );
-        }
-      }
-    } catch (confErr) {
-      console.error(
-        `[extracao-edital] conferência automática falhou (não fatal): ${confErr instanceof Error ? confErr.message : String(confErr)}`,
-      );
-    }
-
     // ---- 6) Persistir composições -------------------------------------------
     // PADRÃO DETECTADO (jul/2026): planilhas com múltiplos blocos/etapas às
     // vezes reiniciam ou repetem a numeração (ex: "1.1" aparece em ETAPA 1 e
@@ -908,7 +848,6 @@ Deno.serve(async (req: Request) => {
         tokens_output: result.usage.candidatesTokenCount ?? null,
         custo_usd: result.estimatedCostUsd,
         duracao_ms: duracaoMs,
-        conferencia_resultado: conferenciaResultado,
         concluido_em: new Date().toISOString(),
       })
       .eq('id', extracaoId);

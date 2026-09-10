@@ -46,6 +46,32 @@ export async function analisarLicitacao(
   const conferenciaResultado =
     (extracao?.conferencia_resultado as ContextoAnalise['conferenciaResultado']) ?? null;
 
+  // Dispara a 2ª passada de conferência quando a extração ainda não foi
+  // auditada. A edge function responde 202 e grava conferencia_resultado em
+  // background — então o painel só mostra o resultado na próxima análise.
+  // Idempotente do lado da function (não re-roda se já tem resultado).
+  if (extracao && !conferenciaResultado) {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session) {
+      try {
+        await fetch(
+          `${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/extracao-conferencia`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${session.access_token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ licitacao_id: licitacaoId }),
+          },
+        );
+      } catch (e) {
+        // Não derruba a análise — a conferência é complementar aos detectores.
+        console.error('[analisarLicitacao] conferência não disparou:', e);
+      }
+    }
+  }
+
   const { data: servicos } = await admin
     .from('composicoes_extraidas')
     .select('item_codigo, descricao, fonte, codigo, orcafascio_composition_id, preco_total')
