@@ -88,6 +88,8 @@ interface ComposicaoExtraida {
   unidade: string | null;
   tipo_linha: string;
   orcafascio_composition_id: string | null;
+  preco_unitario_sem_bdi: number | null;
+  preco_unitario_com_bdi: number | null;
 }
 
 interface ComposicaoPropriaItem {
@@ -99,6 +101,55 @@ interface ComposicaoPropriaItem {
   unidade: string | null;
   coeficiente: number | null;
   preco_unitario: number | null;
+}
+
+/**
+ * Cria (ou reusa) um Resource no MyBase com um preço fixo. Usado tanto pras
+ * sub-composições PROPRIA auxiliares (AUX_) quanto pro fallback de preço de
+ * composições vazias (FALLBACK_) — extraído aqui pra não duplicar a lógica
+ * de staleness (as duas precisam do MESMO cuidado: se o resource já existe
+ * mas com preço zerado/desatualizado, apaga e recria em vez de reusar
+ * cegamente).
+ */
+async function upsertPricedResource(
+  ctx: Parameters<typeof createResource>[0],
+  opts: {
+    code: string;
+    description: string;
+    unit: string;
+    uf: string;
+    groupId: string;
+    preco: number;
+    note: string;
+  },
+): Promise<{ resource_code: string }> {
+  const existing = await findMyBaseResourceByCode(ctx, opts.code);
+  if (existing) {
+    // Se o preço existente está zerado (criado por versão buggy anterior)
+    // e agora temos um preço de verdade, apaga e recria. Do contrário
+    // reusa — evita apagar/recriar resources à toa em todo run.
+    const existingPnd = Number(existing.locals?.[opts.uf]?.pnd ?? 0);
+    if (existingPnd > 0 || opts.preco === 0) {
+      return { resource_code: existing.code };
+    }
+    await deleteResource(ctx, existing.id);
+  }
+  const resource = await createResource(ctx, {
+    group_id: opts.groupId,
+    code: opts.code,
+    description: opts.description.slice(0, 500),
+    type: RESOURCE_TYPE.OUTROS,
+    unit: opts.unit.slice(0, 20),
+    local: opts.uf,
+    // Mesmo preço nos 4 campos — não desonerado/desonerado/improdutivo
+    // (o cálculo correto vem do BDI + leis sociais do orçamento).
+    pnd: opts.preco,
+    pd: opts.preco,
+    pndi: opts.preco,
+    pdi: opts.preco,
+    note: opts.note,
+  });
+  return { resource_code: resource.code };
 }
 
 const ERR_AUTH_TO_HTTP: Record<OrcafascioAuthError['code'], number> = {
@@ -162,7 +213,7 @@ Deno.serve(async (req: Request) => {
 
     const { data: composicoes, error: compErr } = await admin
       .from('composicoes_extraidas')
-      .select('id, item_codigo, codigo, fonte, descricao, unidade, tipo_linha, orcafascio_composition_id')
+      .select('id, item_codigo, codigo, fonte, descricao, unidade, tipo_linha, orcafascio_composition_id, preco_unitario_sem_bdi, preco_unitario_com_bdi')
       .eq('licitacao_id', licitacaoId)
       .eq('fonte', 'PROPRIA')
       .eq('tipo_linha', 'servico');
@@ -202,7 +253,7 @@ Deno.serve(async (req: Request) => {
       .limit(1)
       .maybeSingle();
     const cabecalho = ((extr?.json_corrigido ?? extr?.json_extraido) as
-      { cabecalho?: { data_base_descricao?: string; uf?: string; bases_utilizadas?: string[]; com_desoneracao?: boolean } } | null
+      { cabecalho?: { data_base_descricao?: string; uf?: string; municipio?: string; bases_utilizadas?: string[]; com_desoneracao?: boolean } } | null
     )?.cabecalho ?? {};
     // Monta versão default MM/AAAA do data_base_descricao
     // Aceita: "fev/26", "02/2026", "fevereiro/2026", "JANEIRO/2026"
@@ -285,7 +336,77 @@ Deno.serve(async (req: Request) => {
       }
       return null;
     }
-    const ufEdital = (cabecalho.uf ?? licitacao.uf ?? 'SP').toString().toUpperCase().slice(0, 2);
+    // ---- UF do edital ---------------------------------------------------
+    // BUG (CAPS IJ Imperatriz/MA, set/2026): `cabecalho.uf` e `licitacao.uf`
+    // vinham NULL e o código caía direto no default 'SP'. Resultado: add-bases
+    // era chamado com SINAPI/SP/01-2026 num edital do MARANHÃO — 422
+    // "Region not found" no SBC derrubava a chamada inteira (é all-or-nothing)
+    // e a composição ficava com as bases default da conta. Os códigos do
+    // edital então não eram encontrados → composição sem insumos.
+    //
+    // A UF quase sempre EXISTE no edital, só não no campo `uf`: o
+    // `data_base_descricao` traz "SINAPI - 01/2026 - Maranhão" e o título traz
+    // "no município de Imperatriz/MA". Procuramos nos dois antes de desistir.
+    const UF_POR_ESTADO: Record<string, string> = {
+      'ACRE': 'AC', 'ALAGOAS': 'AL', 'AMAPA': 'AP', 'AMAZONAS': 'AM',
+      'BAHIA': 'BA', 'CEARA': 'CE', 'DISTRITO FEDERAL': 'DF',
+      'ESPIRITO SANTO': 'ES', 'GOIAS': 'GO', 'MARANHAO': 'MA',
+      'MATO GROSSO DO SUL': 'MS', 'MATO GROSSO': 'MT', 'MINAS GERAIS': 'MG',
+      'PARA': 'PA', 'PARAIBA': 'PB', 'PARANA': 'PR', 'PERNAMBUCO': 'PE',
+      'PIAUI': 'PI', 'RIO DE JANEIRO': 'RJ', 'RIO GRANDE DO NORTE': 'RN',
+      'RIO GRANDE DO SUL': 'RS', 'RONDONIA': 'RO', 'RORAIMA': 'RR',
+      'SANTA CATARINA': 'SC', 'SAO PAULO': 'SP', 'SERGIPE': 'SE',
+      'TOCANTINS': 'TO',
+    };
+    const UFS_VALIDAS = new Set(Object.values(UF_POR_ESTADO));
+    const semAcento = (t: string) =>
+      t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase();
+
+    /** Procura nome de estado por extenso num texto livre. */
+    function ufPorNomeDeEstado(texto: string | null | undefined): string | null {
+      if (!texto) return null;
+      const t = semAcento(texto);
+      // Ordena por nome mais longo primeiro pra "MATO GROSSO DO SUL" não ser
+      // capturado por "MATO GROSSO".
+      const nomes = Object.keys(UF_POR_ESTADO).sort((a, b) => b.length - a.length);
+      for (const nome of nomes) {
+        if (t.includes(nome)) return UF_POR_ESTADO[nome];
+      }
+      return null;
+    }
+
+    /** Procura sigla de UF em "Cidade/MA", "Cidade - MA" ou "... MA." */
+    function ufPorSigla(texto: string | null | undefined): string | null {
+      if (!texto) return null;
+      const t = semAcento(texto);
+      const m = t.match(/[\/\-]\s*([A-Z]{2})\b/g) ?? [];
+      for (const bruto of m.reverse()) {
+        const sigla = bruto.replace(/[^A-Z]/g, '');
+        if (UFS_VALIDAS.has(sigla)) return sigla;
+      }
+      return null;
+    }
+
+    const ufEdital = (
+      (cabecalho.uf && String(cabecalho.uf).trim().length === 2
+        ? String(cabecalho.uf)
+        : null) ??
+      (licitacao.uf && String(licitacao.uf).trim().length === 2
+        ? String(licitacao.uf)
+        : null) ??
+      ufPorNomeDeEstado(cabecalho.data_base_descricao) ??
+      ufPorSigla(licitacao.titulo) ??
+      ufPorNomeDeEstado(licitacao.titulo) ??
+      ufPorSigla(cabecalho.municipio) ??
+      'SP'
+    ).toString().toUpperCase().slice(0, 2);
+    if (!cabecalho.uf && !licitacao.uf) {
+      warnings.push(
+        `UF não veio no cabeçalho da extração — deduzida como "${ufEdital}" ` +
+          '(do data_base_descricao/título). Confira: UF errada faz os códigos ' +
+          'do edital não serem encontrados no Orçafascio.',
+      );
+    }
     const basesEdital = Array.isArray(cabecalho.bases_utilizadas)
       ? cabecalho.bases_utilizadas.map((b) => String(b).toUpperCase().trim()).filter((b) => b !== 'PROPRIA')
       : ['SINAPI'];
@@ -341,10 +462,39 @@ Deno.serve(async (req: Request) => {
       AGEHAB: { name: 'AGEHAB', local: '' },      // Agência Habitação (varia por estado)
       TCE: { name: 'TCE', local: '' },            // Tribunal Contas Estado (varia)
     };
-    const basesDaComposicao: Array<{
-      name: string; local: string; version: string; status: boolean; with_labor_charges?: boolean;
-    }> = [];
-    for (const nome of basesEdital) {
+    /** UF específica do banco dentro do data_base_descricao.
+     * Ex: "SINAPI - 01/2026 - Maranhão, ORSE - 11/2025 - Sergipe"
+     *   → SINAPI: "MA", ORSE: "SE".
+     * Sem isso o código usava a UF global do edital pra TODOS os bancos, e
+     * bancos regionais (ORSE só existe em SE) davam 422 "Local not found". */
+    function parseUFPorBanco(descricao: string | undefined, banco: string): string | null {
+      if (!descricao) return null;
+      // Recorta o trecho do banco até a próxima vírgula — a descrição lista
+      // vários bancos separados por vírgula, cada um com seu estado.
+      for (const v of [banco, banco.replace(/3$/, '')]) {
+        const m = semAcento(descricao).match(new RegExp(`${v}\\b([^,]*)`, 'i'));
+        if (!m) continue;
+        const trecho = m[1];
+        const porNome = ufPorNomeDeEstado(trecho);
+        if (porNome) return porNome;
+        const sigla = trecho.match(/\b([A-Z]{2})\b/);
+        if (sigla && UFS_VALIDAS.has(sigla[1])) return sigla[1];
+      }
+      return null;
+    }
+
+    type BaseComposicao = {
+      name: string;
+      local: string;
+      version: string;
+      status: boolean;
+      with_labor_charges?: boolean;
+    };
+    const basesDaComposicao: BaseComposicao[] = [];
+    const basesJaAdicionadas = new Set<string>();
+
+    function adicionarBase(nome: string, avisarSeDesconhecido = true): void {
+      if (!nome || nome === 'PROPRIA' || nome === 'MYBASE' || nome === 'OUTROS') return;
       // FALLBACK INTELIGENTE: se o banco não está no BANK_NORMALIZATION,
       // assume que é um banco regional/estadual e usa a UF do edital. Antes
       // pulávamos (deixando itens sem base → R$ 0,00). Agora tentamos com
@@ -355,9 +505,11 @@ Deno.serve(async (req: Request) => {
       // não pular — preciso desse valor pra fechar o orçamento."
       const cfg = BANK_NORMALIZATION[nome] ?? {
         name: nome,
-        local: ufEdital,  // UF do edital como melhor palpite (uf real é declarado mais abaixo via pickUF)
+        local: ufEdital,
       };
-      if (!BANK_NORMALIZATION[nome]) {
+      if (basesJaAdicionadas.has(cfg.name)) return;
+      basesJaAdicionadas.add(cfg.name);
+      if (!BANK_NORMALIZATION[nome] && avisarSeDesconhecido) {
         warnings.push(
           `Banco "${nome}" não estava mapeado — usando configuração genérica ` +
           `(nome="${nome}", UF="${ufEdital || 'global'}"). Se Orçafascio não conhecer ` +
@@ -381,14 +533,20 @@ Deno.serve(async (req: Request) => {
           version = cfg.versionFallback ?? '028';
         }
       }
+      // UF do banco: a declarada no data_base_descricao pro banco vence
+      // (ex: "ORSE - 11/2025 - Sergipe" → SE), depois a fixa do
+      // BANK_NORMALIZATION, depois a UF do edital.
+      const localEspecifico = parseUFPorBanco(cabecalho.data_base_descricao, cfg.name);
       basesDaComposicao.push({
         name: cfg.name,
-        local: cfg.local || ufEdital,
+        local: localEspecifico ?? (cfg.local || ufEdital),
         version,
         status: true,
         with_labor_charges: !cabecalho.com_desoneracao,
       });
     }
+
+    for (const nome of basesEdital) adicionarBase(nome);
     console.log(
       `[cadastrar-edital] bases da composição: ${basesEdital.join('+')} ${ufEdital} ${dataBaseEdital}`,
     );
@@ -428,6 +586,24 @@ Deno.serve(async (req: Request) => {
       const list = subItensByCompId.get(s.composicao_extraida_id) ?? [];
       list.push(s);
       subItensByCompId.set(s.composicao_extraida_id, list);
+    }
+
+    // Bancos que os SUB-ITENS realmente usam, mas que o cabeçalho não
+    // declarou em bases_utilizadas. Sem isso o add-items devolvia 422
+    // "You don't have this base in your composition." e o insumo sumia da
+    // composição — exatamente o sintoma relatado (composição própria entra
+    // só com parte dos itens).
+    const bancosDosSubItens = new Set<string>();
+    for (const s of (subItens ?? [])) {
+      const bank = fonteToBank(s.fonte);
+      if (bank && bank !== 'MYBASE' && bank !== 'OUTROS') bancosDosSubItens.add(bank);
+    }
+    const bancosExtras = [...bancosDosSubItens].filter((b) => !basesJaAdicionadas.has(b));
+    for (const b of bancosExtras) adicionarBase(b, false);
+    if (bancosExtras.length > 0) {
+      console.log(
+        `[cadastrar-edital] bancos extras vindos dos sub-itens: ${bancosExtras.join('+')}`,
+      );
     }
 
     // ---- 2) Transição: criando_composicoes_edital -----------------------------
@@ -473,7 +649,7 @@ Deno.serve(async (req: Request) => {
       `[cadastrar-edital] grupo ${existingGroup ? 'reusado' : 'criado'}: ${grupo.id} — ${grupoDescricao}`,
     );
 
-    // ---- 4.5) Pré-cria resources auxiliares pra sub-composições PROPRIA --------
+    // ---- 4.5) Pré-cria resources pra TODO sub-item PROPRIA ---------------------
     // Editais frequentemente têm composições próprias que internamente referenciam
     // OUTRAS composições próprias auxiliares (ex: PARALELEPIPEDO+FRETE dentro de
     // PAVIMENTAÇÃO). Essas auxiliares não viram linha do orçamento — só servem
@@ -482,9 +658,20 @@ Deno.serve(async (req: Request) => {
     //
     // Sem isso: add-items envia { bank: 'MYBASE', code: '07', is_resource: false }
     // → Orçafascio busca composição com code='07', não acha → 500.
-    const uf = pickUF(licitacao.uf);
+    //
+    // BUG CORRIGIDO (feedback do orçamentista, set/2026): "no cadastro das
+    // composições próprias, apenas as composições auxiliares estão sendo
+    // adicionadas, faltando inserir os insumos". O filtro abaixo exigia
+    // `classe === 'COMPOSICAO'`, então INSUMOS próprios (ex: "ADV Próprio",
+    // "Encargos complementares") NÃO ganhavam resource no MyBase — o code cru
+    // ia direto pro add-items como { bank: 'MYBASE', code: 'ADV Próprio' } e o
+    // Orçafascio respondia 422 "You don't have this base in your composition."
+    // O insumo então simplesmente não entrava na composição.
+    // Agora TODO sub-item de fonte PROPRIA (COMPOSICAO ou INSUMO) vira
+    // resource no MyBase antes do add-items.
+    const uf = pickUF(licitacao.uf, ufEdital);
     const auxSubItens = (subItens ?? []).filter(
-      (s) => s.fonte === 'PROPRIA' && s.classe === 'COMPOSICAO' && s.codigo,
+      (s) => s.fonte === 'PROPRIA' && s.codigo,
     );
     const auxByOriginalCode = new Map<string, { resource_code: string }>();
     if (auxSubItens.length > 0) {
@@ -494,50 +681,35 @@ Deno.serve(async (req: Request) => {
         if (!uniques.has(s.codigo!)) uniques.set(s.codigo!, s);
       }
       console.log(
-        `[cadastrar-edital] ${uniques.size} sub-composições PROPRIA auxiliares pra cadastrar como Resource`,
+        `[cadastrar-edital] ${uniques.size} sub-itens PROPRIA (composições auxiliares + insumos próprios) pra cadastrar como Resource`,
       );
 
       for (const aux of uniques.values()) {
-        // Code único por licitação pra não colidir entre editais
-        const auxCode = `AUX_${licitacaoId.slice(0, 8)}_${aux.codigo!}`.slice(0, 50);
+        // Code único por licitação pra não colidir entre editais.
+        // Sanitiza: insumos próprios vêm com espaço/acento no código
+        // ("ADV Próprio") e o MyBase não aceita isso como code.
+        const auxCodeLimpo = aux.codigo!
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^A-Za-z0-9_-]/g, '_')
+          .replace(/_+/g, '_')
+          .replace(/^_|_$/g, '');
+        const auxCode = `AUX_${licitacaoId.slice(0, 8)}_${auxCodeLimpo}`.slice(0, 50);
         const preco = aux.preco_unitario != null ? Number(aux.preco_unitario) : 0;
         try {
-          const existing = await findMyBaseResourceByCode(ctx, auxCode);
-          if (existing) {
-            // Se o preço existente está zerado (criado por versão buggy
-            // anterior), apaga e recria com o preço correto.
-            const existingPnd = Number(
-              existing.locals?.[uf]?.pnd ?? 0,
-            );
-            if (existingPnd > 0 || preco === 0) {
-              auxByOriginalCode.set(aux.codigo!, { resource_code: existing.code });
-              continue;
-            }
-            console.log(
-              `[cadastrar-edital] resource ${auxCode} existente com pnd=${existingPnd} — recriando com ${preco}`,
-            );
-            await deleteResource(ctx, existing.id).catch((e) => {
-              warnings.push(
-                `Falha ao apagar resource zerado ${auxCode}: ${e instanceof Error ? e.message.slice(0, 100) : String(e)}`,
-              );
-            });
-          }
-          const resource = await createResource(ctx, {
-            group_id: grupo.id,
+          const { resource_code } = await upsertPricedResource(ctx, {
             code: auxCode,
-            description: (aux.descricao ?? `Sub-composição auxiliar ${aux.codigo}`).slice(0, 500),
-            type: RESOURCE_TYPE.OUTROS,
-            unit: (aux.unidade ?? 'un').slice(0, 20),
-            local: uf,
-            // Mesmo preço nos 4 campos — não desonerado/desonerado/improdutivo
-            // (o cálculo correto vem do BDI + leis sociais do orçamento)
-            pnd: preco,
-            pd: preco,
-            pndi: preco,
-            pdi: preco,
+            description: aux.descricao ??
+              (aux.classe === 'COMPOSICAO'
+                ? `Sub-composição auxiliar ${aux.codigo}`
+                : `Insumo próprio ${aux.codigo}`),
+            unit: aux.unidade ?? 'un',
+            uf,
+            groupId: grupo.id,
+            preco,
             note: `Auxiliar do edital ${licitacao.numero_edital ?? licitacao.id.slice(0, 8)}. Código original "${aux.codigo}".`,
           });
-          auxByOriginalCode.set(aux.codigo!, { resource_code: resource.code });
+          auxByOriginalCode.set(aux.codigo!, { resource_code });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           warnings.push(`Resource auxiliar "${auxCode}" — falhou: ${msg.slice(0, 200)}`);
@@ -663,22 +835,105 @@ Deno.serve(async (req: Request) => {
       // numa composição que já tem items (faz sentido: bases definem onde
       // o servidor procura os codes, não dá pra mudar depois de resolvido).
       const itensJaExistentes = ((created as { items?: unknown[] }).items ?? []).length;
-      if (basesDaComposicao.length > 0 && itensJaExistentes === 0) {
-        try {
-          await addBasesToComposition(ctx, created.id, basesDaComposicao);
-        } catch (e) {
-          // 422 "already in use" (idempotência) é OK; outros 422 (Local
-          // not found, Base not found) precisam de aviso pq itens vão
-          // falhar com 500.
-          const details = (e instanceof OrcafascioApiError && e.details) || null;
-          const detailsStr = details ? JSON.stringify(details).slice(0, 200) : '';
-          const isAlreadyInUse = detailsStr.toLowerCase().includes('already_in_use') ||
-            detailsStr.toLowerCase().includes('já está utilizada');
-          if (!isAlreadyInUse) {
-            warnings.push(
-              `Composição "${codigo}": addBases falhou ${detailsStr || (e instanceof Error ? e.message.slice(0, 120) : '')}. Items dessas bases podem falhar com 500.`,
-            );
+
+      // MYBASE precisa constar entre as bases da composição pra que sub-itens
+      // que apontam pra resources próprios (composições auxiliares e insumos
+      // do edital) sejam aceitos. Sem isso o add-items devolve
+      // 422 "You don't have this base in your composition." — era a causa de
+      // TODOS os insumos próprios sumirem da composição (0 acertos em 703
+      // tentativas no histórico).
+      const usaMyBase = (subItensByCompId.get(comp.id) ?? []).some(
+        (si) => si.fonte === 'PROPRIA' && si.codigo && auxByOriginalCode.has(si.codigo),
+      );
+      const basesParaComposicao: BaseComposicao[] = usaMyBase
+        ? [...basesDaComposicao, { name: 'MYBASE', local: uf, version: '', status: true }]
+        : [...basesDaComposicao];
+
+      if (basesParaComposicao.length > 0 && itensJaExistentes === 0) {
+        // add-bases é ALL-OR-NOTHING: uma única base ruim (ex: SBC com
+        // "Region not found") faz o Orçafascio recusar a chamada inteira, e a
+        // composição fica com as bases default da conta — normalmente de
+        // outro estado/data, então os códigos do edital não são encontrados e
+        // a composição entra vazia ou pela metade. Eram 507 falhas assim no
+        // histórico.
+        //
+        // Agora: quando o 422 identifica quais bases falharam, removemos
+        // SÓ essas e tentamos de novo com o resto. As boas entram; as ruins
+        // viram aviso pro orçamentista.
+        let tentativa = [...basesParaComposicao];
+        const basesRejeitadas: string[] = [];
+        for (let rodada = 0; rodada < 4 && tentativa.length > 0; rodada++) {
+          try {
+            await addBasesToComposition(ctx, created.id, tentativa);
+            break;
+          } catch (e) {
+            // 422 "already in use" (idempotência) é OK.
+            const details = (e instanceof OrcafascioApiError && e.details) || null;
+            const detailsStr = details ? JSON.stringify(details) : '';
+            const lower = detailsStr.toLowerCase();
+            if (lower.includes('already_in_use') || lower.includes('já está utilizada')) {
+              break;
+            }
+            // `details` vem como { errors: [{ "SBC": "Region not found" }, ...] }.
+            // Extrai os nomes pra poder podar e repetir.
+            const nomesRuins = new Set<string>();
+            const errors = (details as { errors?: Array<Record<string, string>> } | null)?.errors;
+            if (Array.isArray(errors)) {
+              for (const err of errors) {
+                for (const nome of Object.keys(err ?? {})) nomesRuins.add(nome);
+              }
+            }
+            const restantes = tentativa.filter((b) => !nomesRuins.has(b.name));
+            if (nomesRuins.size === 0 || restantes.length === tentativa.length) {
+              // Não deu pra identificar a base culpada — mantém o aviso
+              // antigo e desiste (o comportamento de antes).
+              warnings.push(
+                `Composição "${codigo}": addBases falhou ${detailsStr.slice(0, 200) || (e instanceof Error ? e.message.slice(0, 120) : '')}. Items dessas bases podem falhar com 500.`,
+              );
+              tentativa = [];
+              break;
+            }
+            for (const b of tentativa) {
+              if (nomesRuins.has(b.name)) {
+                basesRejeitadas.push(
+                  `${b.name} ${b.local}${b.version ? ` ${b.version}` : ''} (${errors?.find((x) => x?.[b.name])?.[b.name] ?? 'recusada'})`,
+                );
+              }
+            }
+            tentativa = restantes;
           }
+        }
+        // Se o MYBASE foi justamente uma das bases recusadas, tenta formatos
+        // alternativos — é ele que libera os sub-itens próprios, então vale
+        // insistir antes de desistir. Cada tentativa é isolada: falha aqui
+        // não afeta as bases já aplicadas.
+        const myBaseFoiRecusado = usaMyBase &&
+          basesRejeitadas.some((r) => r.startsWith('MYBASE'));
+        if (myBaseFoiRecusado) {
+          const alternativas: BaseComposicao[] = [
+            { name: 'MYBASE', local: uf, version: dataBaseEdital, status: true },
+            { name: 'MYBASE', local: '', version: '', status: true },
+            { name: 'PROPRIA', local: uf, version: '', status: true },
+          ];
+          for (const alt of alternativas) {
+            try {
+              await addBasesToComposition(ctx, created.id, [alt]);
+              console.log(
+                `[cadastrar-edital] MYBASE aceito como {name:${alt.name}, local:"${alt.local}", version:"${alt.version}"}`,
+              );
+              break;
+            } catch {
+              // Próximo formato.
+            }
+          }
+        }
+
+        if (basesRejeitadas.length > 0) {
+          warnings.push(
+            `Composição "${codigo}": ${basesRejeitadas.length} base(s) recusada(s) pelo Orçafascio e ignorada(s) — ` +
+              `${[...new Set(basesRejeitadas)].join('; ')}. As demais bases foram aplicadas; ` +
+              'itens dessas bases recusadas podem entrar sem preço.',
+          );
         }
       }
 
@@ -699,18 +954,102 @@ Deno.serve(async (req: Request) => {
       // Feedback do orçamentista (Batalha): "se em algum caso uma composição
       // própria não for encontrada nos anexos, criar a mesma no orçamento e
       // deixar em branco". É exatamente isso.
-      if (subs.length === 0) {
-        warnings.push(
-          `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}) criada em branco — não havia detalhamento no JSON do edital. Preencha manualmente os insumos/sub-composições no Orçafascio.`,
-        );
-      }
-      // LIMITAÇÃO conhecida da API pública do Orçafascio: insumos do MyBase
-      // (resources cadastrados pela empresa) NÃO podem ser sub-itens de outra
-      // composição MyBase via /add-items (sempre devolve 500). Por isso os
-      // sub-itens PROPRIA+COMPOSICAO auxiliares (AUX_XX) vão pro warning
-      // pra o orçamentista adicionar manualmente na UI web.
+      // Sub-itens PROPRIA (composições auxiliares AUX_XX e insumos próprios)
+      // são enviados como resources do MyBase. Isso só funciona porque a
+      // composição recebeu MYBASE entre suas bases logo acima — sem essa base
+      // o Orçafascio recusa com 422 "You don't have this base in your
+      // composition." Se mesmo assim algum for recusado, o laço item-a-item
+      // mais abaixo gera aviso pra adição manual na UI web.
       const itemsParaApi: CompositionItem[] = [];
       const subItensManuais: string[] = [];
+
+      if (subs.length === 0) {
+        // FALLBACK (jul/2026): antes a composição ficava em branco (R$ 0,00)
+        // até alguém preencher manualmente — mesmo quando o PREÇO do item já
+        // tinha sido extraído certinho da planilha oficial do edital (só o
+        // DETALHAMENTO em sub-itens/insumos que faltava, geralmente porque a
+        // planilha auxiliar do órgão não veio na extração). Isso fazia o
+        // total do orçamento nunca bater com o edital.
+        //
+        // Reusa o MESMO mecanismo já testado em produção pras sub-composições
+        // PROPRIA auxiliares (ver "passo 4.5" acima, comentário "testes
+        // empíricos"): cria um Resource no MyBase com o preço JÁ CONHECIDO
+        // (não inventado — é o preco_unitario_sem_bdi extraído da planilha
+        // oficial) e adiciona como o único item da composição via
+        // type:'resource' (que funciona pela API — só composição-dentro-de-
+        // composição que 500a). O BDI é aplicado depois pelo orçamento, então
+        // usamos o preço SEM BDI aqui.
+        const precoConhecido = comp.preco_unitario_sem_bdi != null
+          ? Number(comp.preco_unitario_sem_bdi)
+          : comp.preco_unitario_com_bdi != null
+            ? Number(comp.preco_unitario_com_bdi)
+            : 0;
+        if (precoConhecido > 0) {
+          const fallbackCode = `FALLBACK_${codigo}`.slice(0, 50);
+          try {
+            const { resource_code } = await upsertPricedResource(ctx, {
+              code: fallbackCode,
+              description: `${descricao} (preço do edital — sem detalhamento de insumos)`,
+              unit: unidade,
+              uf,
+              groupId: grupo.id,
+              preco: precoConhecido,
+              note:
+                `Fallback automático: composição "${comp.item_codigo}" sem detalhamento no JSON do ` +
+                'edital. Preço reproduzido de composicoes_extraidas.preco_unitario_sem_bdi (extraído ' +
+                'da planilha oficial). Substitua por insumos reais quando/se a planilha auxiliar ' +
+                'do órgão for localizada.',
+            });
+            itemsParaApi.push({ bank: 'MYBASE', code: resource_code, qty: 1, type: 'resource' });
+
+            // Grava também na NOSSA tabela (composicao_propria_itens) — sem
+            // isso, composicoesVazias (frontend/src/lib/agente/actions.ts)
+            // continuava marcando esta composição como "vazia" pra sempre,
+            // mesmo depois do fallback já ter preenchido o preço no
+            // Orçafascio, e o detector de "total abaixo do edital" seguia
+            // oferecendo "Forçar Total" e inflando um total que já batia.
+            const { error: subItemErr } = await admin
+              .from('composicao_propria_itens')
+              .insert({
+                composicao_extraida_id: comp.id,
+                classe: 'INSUMO',
+                codigo: resource_code,
+                fonte: 'OUTRA',
+                descricao: `${descricao} (preço do edital — fallback automático, sem detalhamento real de insumos)`.slice(0, 500),
+                unidade,
+                coeficiente: 1,
+                preco_unitario: precoConhecido,
+                preco_total: precoConhecido,
+                orcafascio_resource_id: resource_code,
+                ordem: 0,
+              });
+            if (subItemErr) {
+              warnings.push(
+                `Composição "${codigo}": fallback de preço aplicado no Orçafascio, mas falhou ao registrar ` +
+                  `localmente (${subItemErr.message.slice(0, 150)}) — pode continuar aparecendo como "vazia" nos diagnósticos.`,
+              );
+            }
+
+            warnings.push(
+              `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}): sem detalhamento no JSON do edital — ` +
+                `preenchida com o preço já extraído da planilha oficial (R$ ${precoConhecido.toFixed(2)}, sem BDI) ` +
+                'como item único. Substitua pelos insumos reais no Orçafascio quando localizar a planilha auxiliar do órgão.',
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            warnings.push(
+              `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}) criada em branco — falha ao aplicar ` +
+                `fallback de preço (${msg.slice(0, 150)}). Preencha manualmente os insumos no Orçafascio.`,
+            );
+          }
+        } else {
+          warnings.push(
+            `Composição "${codigo}" (${(comp.descricao ?? '').slice(0, 60)}) criada em branco — não havia ` +
+              'detalhamento no JSON do edital nem preço extraído pra usar de fallback. Preencha manualmente ' +
+              'os insumos/sub-composições no Orçafascio.',
+          );
+        }
+      }
       // Cruzamento payload → sub_item original (pro fallback poder logar
       // descrição/preço quando o code falha)
       const itemPayloadToSub = new Map<string, ComposicaoPropriaItem>();
@@ -732,13 +1071,40 @@ Deno.serve(async (req: Request) => {
           });
           continue;
         }
-        const isAuxPropria = s.fonte === 'PROPRIA' && s.classe === 'COMPOSICAO';
-        if (isAuxPropria) {
+        // Sub-item PROPRIA (composição auxiliar OU insumo próprio): entra
+        // referenciando o Resource criado no MyBase no passo 4.5.
+        //
+        // ANTES: esses itens eram PULADOS e viravam só um aviso "adicione
+        // manualmente" — a composição própria ficava sem eles. Só que o code
+        // enviado era o CRU ("ADV Próprio", "07"), que não existe no MyBase;
+        // o 422 "You don't have this base in your composition" não vinha de
+        // uma limitação da API e sim de (a) code inexistente e (b) MYBASE não
+        // estar entre as bases da composição. As duas coisas agora são
+        // resolvidas: resource pré-criado (4.5) + MYBASE nas bases.
+        //
+        // Se ainda assim o Orçafascio recusar, o laço item-a-item mais abaixo
+        // captura a falha e gera o mesmo aviso de adição manual — ou seja,
+        // nunca ficamos pior do que estávamos.
+        if (s.fonte === 'PROPRIA') {
           const aux = auxByOriginalCode.get(s.codigo);
-          subItensManuais.push(
-            `[Adicionar manual] ${s.codigo} ${(s.descricao ?? '').slice(0, 60)}` +
-            (aux ? ` (Resource MyBase: ${aux.resource_code}, ${s.unidade ?? ''}, ${s.preco_unitario != null ? `R$ ${Number(s.preco_unitario).toFixed(2)}` : 'sem preço'}) — coef ${s.coeficiente}` : ''),
-          );
+          if (!aux) {
+            // O resource não pôde ser criado no passo 4.5 — sem code válido
+            // não há o que enviar, então mantém o aviso de adição manual.
+            subItensManuais.push(
+              `[Adicionar manual] ${s.codigo} ${(s.descricao ?? '').slice(0, 60)}` +
+              ` (${s.unidade ?? ''}, ${s.preco_unitario != null ? `R$ ${Number(s.preco_unitario).toFixed(2)}` : 'sem preço'}) — coef ${s.coeficiente}`,
+            );
+            continue;
+          }
+          itemPayloadToSub.set(`MYBASE/${aux.resource_code}`, s);
+          itemsParaApi.push({
+            bank: 'MYBASE',
+            code: aux.resource_code,
+            qty: s.coeficiente,
+            // Criado como Resource no MyBase, inclusive as composições
+            // auxiliares — então sempre 'resource'.
+            type: 'resource',
+          });
           continue;
         }
         // Aplica mapeamento de code descontinuado (auto-substituição).
@@ -764,7 +1130,7 @@ Deno.serve(async (req: Request) => {
       const items = itemsParaApi;
       if (subItensManuais.length > 0) {
         warnings.push(
-          `Composição "${codigo}": ${subItensManuais.length} sub-item(ns) PROPRIA auxiliar — Orçafascio API não aceita resource MyBase como sub-item, adicione manualmente na UI: ${subItensManuais.join('; ')}`,
+          `Composição "${codigo}": ${subItensManuais.length} sub-item(ns) PROPRIA sem resource no MyBase — adicione manualmente na UI: ${subItensManuais.join('; ')}`,
         );
       }
       // Warning consolidado dos sub-items descartados pelo filtro de validação.
@@ -852,7 +1218,9 @@ Deno.serve(async (req: Request) => {
               );
               // Registra na tabela de mapeamentos pra o user mapear depois
               // (idempotente — ON CONFLICT DO NOTHING).
-              if (sub) {
+              // Codes MYBASE são resources nossos, não códigos de banco
+              // público — não faz sentido pedir substituição pro usuário.
+              if (sub && it.bank !== 'MYBASE') {
                 await admin
                   .from('orcafascio_code_mappings')
                   .upsert({
