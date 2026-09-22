@@ -1300,7 +1300,7 @@ Deno.serve(async (req: Request) => {
                     fonte_original: it.bank,
                     codigo_original: it.code,
                     descricao: sub.descricao ?? null,
-                    motivo: 'addItemsToComposition retornou 500 — code provável descontinuado',
+                    motivo: 'addItemsToComposition recusou em todos os formatos — code provável descontinuado',
                   }, { onConflict: 'fonte_original,codigo_original', ignoreDuplicates: true });
               }
             }
