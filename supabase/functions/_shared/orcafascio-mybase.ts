@@ -147,10 +147,11 @@ export interface CompositionItem {
   qty: number;               // Coeficiente
   /** "resource" = insumo, "composition" = sub-composição.
    *
-   * IMPORTANTE — testes empíricos mostraram que o Orçafascio aceita
-   * `type: "resource"` e devolve 500 silencioso pra `is_resource: true`.
-   * Composições funcionam SEM o campo type também (caem em "composition"
-   * por default), mas mandar explícito é mais robusto. */
+   * ATENÇÃO: o Orçafascio NÃO honra esse campo de forma confiável — com
+   * `type: "resource"` ele ainda procura o código entre as composições e
+   * responde "Composition not found". Quem chama deve estar preparado pra
+   * tentar outros formatos (vide `variantesDoItem` em
+   * orcafascio-cadastrar-edital). */
   type: 'resource' | 'composition';
 }
 
@@ -538,6 +539,10 @@ export async function removeItemsFromComposition(
  * conta (geralmente SINAPI/AC/01-2026), e códigos só existem em outros
  * estados/datas → addItemsToComposition retorna 500 silencioso pra esses
  * códigos. Endpoint correto: `/add-bases` (hífen, não underscore).
+ *
+ * ATENÇÃO: é ALL-OR-NOTHING — uma base inválida faz a chamada inteira
+ * falhar com 422 e NENHUMA base é aplicada. Quem chama deve podar as bases
+ * recusadas e repetir.
  *
  * Body por banco:
  *   - name: 'SINAPI' | 'SICRO' | 'ORSE' | etc

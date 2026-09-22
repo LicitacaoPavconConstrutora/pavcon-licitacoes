@@ -152,6 +152,48 @@ async function upsertPricedResource(
   return { resource_code: resource.code };
 }
 
+/**
+ * Formatos de payload a tentar pra UM item do /add-items, em ordem.
+ *
+ * BUG (CAMPO SOCIETY, set/2026): todo INSUMO era recusado com
+ * `"Composition not found."` mesmo enviando `type: "resource"` — o
+ * Orçafascio ignora o campo e procura o código na tabela de composições.
+ * Só entravam os códigos que SÃO composição de verdade (88xxx/9xxxx, mão de
+ * obra), então a composição própria ficava sem material nenhum e o PU saía
+ * uma fração do real.
+ *
+ * O formato certo não está documentado. O teste de mai/2026 que concluiu
+ * "is_resource:true dá 500" usava `add_bases` (underscore) em vez de
+ * `add-bases`, então a composição de teste ficava sem bases e aquele 500
+ * não prova nada.
+ *
+ * Em vez de adivinhar, tentamos as formas conhecidas em sequência e
+ * registramos qual funcionou. O custo é só pros itens que JÁ estavam
+ * falhando (o lote inteiro continua sendo a primeira tentativa), e o
+ * comportamento nunca fica pior: esgotadas as variantes, cai no mesmo
+ * aviso de adição manual de antes.
+ *
+ * A última variante inverte o discriminador de propósito: a classe vem da
+ * extração do edital e pode estar trocada (insumo marcado como composição
+ * e vice-versa).
+ */
+function variantesDoItem(
+  it: CompositionItem,
+): Array<{ label: string; payload: Record<string, unknown> }> {
+  const base = { bank: it.bank, code: it.code, qty: it.qty };
+  const comoResource = [
+    { label: "type:'resource'", payload: { ...base, type: 'resource' } },
+    { label: 'is_resource:true', payload: { ...base, is_resource: true } },
+    { label: 'sem discriminador', payload: { ...base } },
+  ];
+  const comoComposicao = [
+    { label: "type:'composition'", payload: { ...base, type: 'composition' } },
+  ];
+  return it.type === 'resource'
+    ? [...comoResource, ...comoComposicao]
+    : [...comoComposicao, ...comoResource];
+}
+
 const ERR_AUTH_TO_HTTP: Record<OrcafascioAuthError['code'], number> = {
   credential_not_found: 404,
   credential_inactive: 403,
@@ -733,6 +775,11 @@ Deno.serve(async (req: Request) => {
     // não disparava. Esta versão (v45) trackeia em memória, garantido.
     const codesJaProcessadosNesseRun = new Set<string>();
 
+    // Quais formatos de payload o Orçafascio aceitou nesta rodada. Vai pro
+    // resumo do cadastro pra que o formato certo seja descoberto a partir de
+    // uso real, em vez de continuar no chute.
+    const formatosQueFuncionaram = new Set<string>();
+
     for (const comp of (composicoes as ComposicaoExtraida[])) {
       // Idempotência: se já tem orcafascio_composition_id, pula
       if (comp.orcafascio_composition_id) {
@@ -1191,22 +1238,48 @@ Deno.serve(async (req: Request) => {
           let oneByOneOk = 0;
           const failuresManual: string[] = [];
           for (const it of items) {
-            try {
-              await addItemsToComposition(ctx, created.id, [it]);
-              oneByOneOk++;
-            } catch (e2) {
-              // 422 "already_in_use" = sucesso. O batch que falhou com 500
-              // espúrio na verdade adicionou os items — quando tentamos
-              // de novo, a API diz "já está em uso". Conta como OK.
-              const details = (e2 instanceof OrcafascioApiError && e2.details) || null;
-              const detailsStr = details ? JSON.stringify(details) : '';
-              if (detailsStr.includes('already_in_use')) {
-                oneByOneOk++;
-                continue;
+            // Percorre os formatos de payload conhecidos até um ser aceito.
+            let aceito = false;
+            let ultimoErro: unknown = null;
+            // Um formato que JÁ funcionou nesta rodada vai primeiro: economiza
+            // 3 chamadas por item num edital com centenas de insumos.
+            const variantes = variantesDoItem(it).sort((a, b) =>
+              Number(formatosQueFuncionaram.has(b.label)) -
+              Number(formatosQueFuncionaram.has(a.label))
+            );
+            for (const variante of variantes) {
+              try {
+                await addItemsToComposition(
+                  ctx,
+                  created.id,
+                  [variante.payload as unknown as CompositionItem],
+                );
+                aceito = true;
+                formatosQueFuncionaram.add(variante.label);
+                break;
+              } catch (eVar) {
+                // 422 "already_in_use" = sucesso. O lote que falhou na
+                // verdade adicionou o item — quando tentamos de novo, a API
+                // diz "já está em uso".
+                const d = (eVar instanceof OrcafascioApiError && eVar.details) || null;
+                if (d && JSON.stringify(d).includes('already_in_use')) {
+                  aceito = true;
+                  break;
+                }
+                ultimoErro = eVar;
               }
-              // 500 persistente. Provavelmente o code não existe no banco
-              // do Orçafascio (descontinuado ou de outra versão). Gera
+            }
+            if (aceito) {
+              oneByOneOk++;
+              continue;
+            }
+            {
+              // Nenhum formato foi aceito. O code provavelmente não existe no
+              // banco do Orçafascio (descontinuado ou de outra versão). Gera
               // warning detalhado com info do edital pra adição manual.
+              const motivoFinal = ultimoErro instanceof OrcafascioApiError
+                ? `${ultimoErro.status} ${JSON.stringify(ultimoErro.details).slice(0, 120)}`
+                : (ultimoErro instanceof Error ? ultimoErro.message.slice(0, 120) : 'erro desconhecido');
               const sub = itemPayloadToSub.get(`${it.bank}/${it.code}`);
               const desc = (sub?.descricao ?? '').slice(0, 80);
               const preco = sub?.preco_unitario != null
@@ -1214,7 +1287,7 @@ Deno.serve(async (req: Request) => {
                 : 's/preço';
               const unid = sub?.unidade ?? '';
               failuresManual.push(
-                `${it.bank}/${it.code} ${desc} (${unid}, ${preco}, coef ${it.qty})`,
+                `${it.bank}/${it.code} ${desc} (${unid}, ${preco}, coef ${it.qty}) — ${motivoFinal}`,
               );
               // Registra na tabela de mapeamentos pra o user mapear depois
               // (idempotente — ON CONFLICT DO NOTHING).
@@ -1227,7 +1300,7 @@ Deno.serve(async (req: Request) => {
                     fonte_original: it.bank,
                     codigo_original: it.code,
                     descricao: sub.descricao ?? null,
-                    motivo: 'addItemsToComposition retornou 500 — code provável descontinuado',
+                    motivo: 'addItemsToComposition recusou em todos os formatos — code provável descontinuado',
                   }, { onConflict: 'fonte_original,codigo_original', ignoreDuplicates: true });
               }
             }
@@ -1246,6 +1319,15 @@ Deno.serve(async (req: Request) => {
         .from('composicoes_extraidas')
         .update({ orcafascio_composition_id: created.id })
         .eq('id', comp.id);
+    }
+
+    if (formatosQueFuncionaram.size > 0) {
+      const lista = [...formatosQueFuncionaram].join(', ');
+      console.log(`[cadastrar-edital] formatos de add-items aceitos: ${lista}`);
+      warnings.push(
+        `Diagnóstico: itens que o lote recusou foram aceitos individualmente usando ${lista}. ` +
+          'Isso identifica o formato correto de payload pro /add-items — informe ao time técnico.',
+      );
     }
 
     // ---- 6) Transição: fase1_concluida -----------------------------------------
@@ -1270,16 +1352,46 @@ Deno.serve(async (req: Request) => {
       typeof w === 'string' && !w.startsWith('[Passo 1 - MyBase]'),
     );
     const warningsMybasePrefixed = warnings.map((w) => `[Passo 1 - MyBase] ${w}`);
+
+    // BUG (CAMPO SOCIETY, set/2026): rodar o Passo 1 de novo APAGAVA o
+    // diagnóstico da 1ª rodada. Na 2ª passada toda composição já tem
+    // orcafascio_composition_id, então o laço pula tudo e termina com
+    // 0 criadas / 0 itens / 0 avisos — e esse zero sobrescrevia os avisos
+    // reais. O painel passava a dizer "nenhuma pendência" enquanto dezenas
+    // de insumos tinham sido recusados na rodada que valeu.
+    //
+    // Se esta rodada não fez NADA (tudo pulado, nenhum aviso novo),
+    // preserva o diagnóstico anterior em vez de zerá-lo.
+    const rodadaSemEfeito = composicoesCriadas === 0 &&
+      itensAdicionados === 0 &&
+      warnings.length === 0;
+    const mybaseAnterior = resumoAtual.mybase as Record<string, unknown> | undefined;
+    const warningsPasso1Anteriores = warningsAtuais.filter((w) =>
+      typeof w === 'string' && w.startsWith('[Passo 1 - MyBase]'),
+    );
+    const preservaAnterior = rodadaSemEfeito && mybaseAnterior != null;
+
     const resumoNovo = {
       ...resumoAtual,
-      mybase: {
-        composicoes_criadas: composicoesCriadas,
-        composicoes_puladas: composicoesPuladas,
-        itens_adicionados: itensAdicionados,
-        warnings,
-        finalizado_em: new Date().toISOString(),
-      },
-      warnings: [...warningsMybasePrefixed, ...warningsPasso2],
+      mybase: preservaAnterior
+        ? {
+          ...mybaseAnterior,
+          // Deixa explícito que houve uma re-execução sem efeito, sem
+          // perder os números e avisos da rodada que realmente cadastrou.
+          reexecutado_em: new Date().toISOString(),
+          reexecucao_sem_efeito: true,
+          composicoes_puladas: composicoesPuladas,
+        }
+        : {
+          composicoes_criadas: composicoesCriadas,
+          composicoes_puladas: composicoesPuladas,
+          itens_adicionados: itensAdicionados,
+          warnings,
+          finalizado_em: new Date().toISOString(),
+        },
+      warnings: preservaAnterior
+        ? [...warningsPasso1Anteriores, ...warningsPasso2]
+        : [...warningsMybasePrefixed, ...warningsPasso2],
     };
     await admin
       .from('licitacoes')
