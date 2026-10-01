@@ -153,45 +153,65 @@ async function upsertPricedResource(
 }
 
 /**
- * Formatos de payload a tentar pra UM item do /add-items, em ordem.
+ * Payload correto pra UM item do /add-items.
  *
- * BUG (CAMPO SOCIETY, set/2026): todo INSUMO era recusado com
- * `"Composition not found."` mesmo enviando `type: "resource"` — o
- * Orçafascio ignora o campo e procura o código na tabela de composições.
- * Só entravam os códigos que SÃO composição de verdade (88xxx/9xxxx, mão de
- * obra), então a composição própria ficava sem material nenhum e o PU saía
- * uma fração do real.
+ * DESCOBERTO EM PRODUÇÃO (licitação TESTE, 22/09/2026) — o log de auditoria
+ * fechou a questão, que estava em aberto desde mai/2026:
  *
- * O formato certo não está documentado. O teste de mai/2026 que concluiu
- * "is_resource:true dá 500" usava `add_bases` (underscore) em vez de
- * `add-bases`, então a composição de teste ficava sem bases e aquele 500
- * não prova nada.
+ *   INSUMO      → { bank, code, qty, is_resource: true }   ← 200 confirmado
+ *   COMPOSIÇÃO  → { bank, code, qty, type: 'composition' } ← 200 confirmado
  *
- * Em vez de adivinhar, tentamos as formas conhecidas em sequência e
- * registramos qual funcionou. O custo é só pros itens que JÁ estavam
- * falhando (o lote inteiro continua sendo a primeira tentativa), e o
- * comportamento nunca fica pior: esgotadas as variantes, cai no mesmo
- * aviso de adição manual de antes.
+ * O campo `type: 'resource'` é ATIVAMENTE PERIGOSO e foi removido: o
+ * Orçafascio o IGNORA e resolve o código no catálogo de COMPOSIÇÕES. Como os
+ * códigos colidem entre os dois catálogos, ele insere um item completamente
+ * diferente. Caso real: ORSE 10394 é "Bucha em liga zamak" (insumo, R$ 0,35)
+ * E "Muro de contenção em L" (composição, R$ 3.427,03). Enviar
+ * `type:'resource'` trouxe o muro de contenção pra dentro de uma composição
+ * de bucha de eletroduto — PU de R$ 1,29 virou R$ 3.696,08.
  *
- * A última variante inverte o discriminador de propósito: a classe vem da
- * extração do edital e pode estar trocada (insumo marcado como composição
- * e vice-versa).
+ * Pela mesma razão NÃO existe mais fallback cego entre catálogos. A troca de
+ * catálogo só acontece quando o próprio Orçafascio diz que o código NÃO
+ * EXISTE naquele catálogo ("Resource not found" / "Composition not found") —
+ * aí a classe veio trocada da extração e trocar é justamente o conserto.
  */
-function variantesDoItem(
-  it: CompositionItem,
-): Array<{ label: string; payload: Record<string, unknown> }> {
+function payloadDoItem(it: CompositionItem): Record<string, unknown> {
   const base = { bank: it.bank, code: it.code, qty: it.qty };
-  const comoResource = [
-    { label: "type:'resource'", payload: { ...base, type: 'resource' } },
-    { label: 'is_resource:true', payload: { ...base, is_resource: true } },
-    { label: 'sem discriminador', payload: { ...base } },
-  ];
-  const comoComposicao = [
-    { label: "type:'composition'", payload: { ...base, type: 'composition' } },
-  ];
-  return it.type === 'resource'
-    ? [...comoResource, ...comoComposicao]
-    : [...comoComposicao, ...comoResource];
+  return it.type === 'composition'
+    ? { ...base, type: 'composition' }
+    : { ...base, is_resource: true };
+}
+
+/** O payload do catálogo oposto, usado SÓ quando o Orçafascio responde
+ * "not found" — ou seja, quando a classe da extração estava trocada. */
+function payloadCatalogoOposto(it: CompositionItem): Record<string, unknown> {
+  const base = { bank: it.bank, code: it.code, qty: it.qty };
+  return it.type === 'composition'
+    ? { ...base, is_resource: true }
+    : { ...base, type: 'composition' };
+}
+
+/** O Orçafascio sinaliza "esse item já está na composição" de várias formas:
+ * `already_in_use`, "This composition is already in your composition.",
+ * "já está utilizada". Todas significam SUCESSO — o item está lá.
+ *
+ * Reconhecer isso é crítico: um lote pode responder 500 e MESMO ASSIM ter
+ * aplicado os itens. Sem enxergar o "already", o retry item-a-item concluía
+ * que tinha falhado e tentava outro formato, duplicando a linha — foi assim
+ * que a composição de bucha ganhou um muro de contenção. */
+function jaEstaNaComposicao(detalhes: unknown): boolean {
+  if (detalhes == null) return false;
+  const t = JSON.stringify(detalhes).toLowerCase();
+  return t.includes('already_in_use') ||
+    t.includes('already in your') ||
+    t.includes('já está utilizada');
+}
+
+/** "Resource not found" / "Composition not found" — o código não existe
+ * naquele catálogo, então vale tentar o catálogo oposto. */
+function naoExisteNesseCatalogo(detalhes: unknown): boolean {
+  if (detalhes == null) return false;
+  const t = JSON.stringify(detalhes).toLowerCase();
+  return t.includes('not found');
 }
 
 const ERR_AUTH_TO_HTTP: Record<OrcafascioAuthError['code'], number> = {
@@ -1223,7 +1243,16 @@ Deno.serve(async (req: Request) => {
         codesJaProcessadosNesseRun.add(codigo);
       } else if (items.length > 0) {
         try {
-          await addItemsToComposition(ctx, created.id, items);
+          // O lote também vai no formato correto por classe. Antes mandava
+          // `type:'resource'` nos insumos, que o Orçafascio ignora — e um
+          // lote assim pode responder 500 TENDO aplicado os itens no
+          // catálogo errado (foi o que trouxe um muro de contenção pra dentro
+          // de uma composição de bucha de eletroduto).
+          await addItemsToComposition(
+            ctx,
+            created.id,
+            items.map((it) => payloadDoItem(it) as unknown as CompositionItem),
+          );
           itensAdicionados += items.length;
           // Marca code como processado — próxima iteração do mesmo code
           // pula addItems pra não duplicar sub-itens.
@@ -1238,41 +1267,77 @@ Deno.serve(async (req: Request) => {
           let oneByOneOk = 0;
           const failuresManual: string[] = [];
           for (const it of items) {
-            // Percorre os formatos de payload conhecidos até um ser aceito.
-            let aceito = false;
-            let ultimoErro: unknown = null;
-            // Um formato que JÁ funcionou nesta rodada vai primeiro: economiza
-            // 3 chamadas por item num edital com centenas de insumos.
-            const variantes = variantesDoItem(it).sort((a, b) =>
-              Number(formatosQueFuncionaram.has(b.label)) -
-              Number(formatosQueFuncionaram.has(a.label))
-            );
-            for (const variante of variantes) {
+            /** Envia um payload e classifica a resposta.
+             *
+             * O 500 do Orçafascio é ambíguo: às vezes nada foi aplicado, às
+             * vezes o item ENTROU e o erro é espúrio. Reenviar o MESMO
+             * payload desfaz a ambiguidade sem risco — se tinha entrado, a
+             * resposta vira "already in your composition" (sucesso); se não,
+             * falha de novo. O que não se pode fazer é trocar de formato após
+             * um 500: aí sim a linha duplica, agora com o item errado.
+             */
+            const enviar = async (
+              payload: Record<string, unknown>,
+            ): Promise<{ ok: boolean; erro?: unknown }> => {
               try {
                 await addItemsToComposition(
                   ctx,
                   created.id,
-                  [variante.payload as unknown as CompositionItem],
+                  [payload as unknown as CompositionItem],
                 );
-                aceito = true;
-                formatosQueFuncionaram.add(variante.label);
-                break;
-              } catch (eVar) {
-                // 422 "already_in_use" = sucesso. O lote que falhou na
-                // verdade adicionou o item — quando tentamos de novo, a API
-                // diz "já está em uso".
-                const d = (eVar instanceof OrcafascioApiError && eVar.details) || null;
-                if (d && JSON.stringify(d).includes('already_in_use')) {
-                  aceito = true;
-                  break;
+                return { ok: true };
+              } catch (e1) {
+                const d1 = (e1 instanceof OrcafascioApiError && e1.details) || null;
+                if (jaEstaNaComposicao(d1)) return { ok: true };
+                const status = e1 instanceof OrcafascioApiError ? e1.status : 0;
+                if (status !== 500) return { ok: false, erro: e1 };
+                // 500 ambíguo — reenvia o MESMO payload pra descobrir se
+                // entrou.
+                try {
+                  await addItemsToComposition(
+                    ctx,
+                    created.id,
+                    [payload as unknown as CompositionItem],
+                  );
+                  // Entrou agora (o 500 anterior não tinha aplicado).
+                  return { ok: true };
+                } catch (e2) {
+                  const d2 = (e2 instanceof OrcafascioApiError && e2.details) || null;
+                  if (jaEstaNaComposicao(d2)) return { ok: true };
+                  return { ok: false, erro: e2 };
                 }
-                ultimoErro = eVar;
+              }
+            };
+
+            const principal = payloadDoItem(it);
+            let r = await enviar(principal);
+            let formatoUsado = it.type === 'composition'
+              ? "type:'composition'"
+              : 'is_resource:true';
+
+            // SÓ troca de catálogo quando o Orçafascio diz que o código não
+            // existe nesse catálogo — sinal de que a classe veio trocada da
+            // extração. Nunca é um chute: com os códigos colidindo entre
+            // catálogos, um chute insere outro item com preço completamente
+            // diferente.
+            const erroPrincipal = r.erro;
+            if (!r.ok && naoExisteNesseCatalogo(
+              erroPrincipal instanceof OrcafascioApiError ? erroPrincipal.details : null,
+            )) {
+              r = await enviar(payloadCatalogoOposto(it));
+              if (r.ok) {
+                formatoUsado = it.type === 'composition'
+                  ? 'is_resource:true (classe trocada na extração)'
+                  : "type:'composition' (classe trocada na extração)";
               }
             }
-            if (aceito) {
+
+            if (r.ok) {
+              formatosQueFuncionaram.add(formatoUsado);
               oneByOneOk++;
               continue;
             }
+            const ultimoErro = r.erro ?? erroPrincipal;
             {
               // Nenhum formato foi aceito. O code provavelmente não existe no
               // banco do Orçafascio (descontinuado ou de outra versão). Gera
@@ -1324,10 +1389,13 @@ Deno.serve(async (req: Request) => {
     if (formatosQueFuncionaram.size > 0) {
       const lista = [...formatosQueFuncionaram].join(', ');
       console.log(`[cadastrar-edital] formatos de add-items aceitos: ${lista}`);
-      warnings.push(
-        `Diagnóstico: itens que o lote recusou foram aceitos individualmente usando ${lista}. ` +
-          'Isso identifica o formato correto de payload pro /add-items — informe ao time técnico.',
-      );
+      if (lista.includes('classe trocada')) {
+        warnings.push(
+          `Itens cuja classe veio trocada da extração foram corrigidos no cadastro (${lista}). ` +
+            'Confira no Orçafascio se o item que entrou é o do edital — há códigos que existem ' +
+            'como insumo E como composição no mesmo banco, com preços bem diferentes.',
+        );
+      }
     }
 
     // ---- 6) Transição: fase1_concluida -----------------------------------------
