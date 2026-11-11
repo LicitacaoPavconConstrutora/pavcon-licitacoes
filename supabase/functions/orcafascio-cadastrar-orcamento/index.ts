@@ -500,6 +500,10 @@ Deno.serve(async (req: Request) => {
     const items: BudgetItem[] = [];
     let etapasCriadas = 0;
     let composicoesCriadas = 0;
+    // Serviços que NÃO entraram no orçamento, por motivo. Sem isso o
+    // orçamentista não tem como saber que faltou coisa.
+    const descartadosSemCodigo: string[] = [];
+    const descartadosSemMyBase: string[] = [];
 
     for (const c of comps) {
       if (c.tipo_linha === 'grupo') {
@@ -571,8 +575,24 @@ Deno.serve(async (req: Request) => {
         if (codeOriginal !== codeNormalizado && !isPropria) {
           console.log(`[cadastrar-orcamento] code normalizado: ${c.fonte}/${codeOriginal} → ${codeNormalizado} (item ${c.item_codigo})`);
         }
-        if (!codeNormalizado) continue;
-        if (isPropria && !c.orcafascio_composition_id) continue;
+        // DESCARTES: antes eram dois `continue` silenciosos. Um orçamento
+        // podia sair VAZIO e mesmo assim ser reportado como sucesso — foi
+        // exatamente o que o orçamentista viu: orçamento criado, "Não
+        // iniciado", zero itens, painel sem apontar nada.
+        if (!codeNormalizado) {
+          descartadosSemCodigo.push(
+            `${c.item_codigo} ${(c.descricao ?? '').slice(0, 50)}`,
+          );
+          continue;
+        }
+        if (isPropria && !c.orcafascio_composition_id) {
+          // A composição própria só ganha orcafascio_composition_id no
+          // Passo 1 (MyBase). Sem ele não há o que referenciar aqui.
+          descartadosSemMyBase.push(
+            `${c.item_codigo} ${(c.descricao ?? '').slice(0, 50)}`,
+          );
+          continue;
+        }
 
         items.push({
           kind: 'composition',
@@ -585,6 +605,91 @@ Deno.serve(async (req: Request) => {
         });
         composicoesCriadas++;
       }
+    }
+
+    // ---- 8.1) NADA PRA CADASTRAR = FALHA, NÃO SUCESSO --------------------
+    // Antes, `items` vazio simplesmente pulava o envio e a function seguia
+    // retornando 200 com budget_url. O orçamentista recebia um link pra um
+    // orçamento "Não iniciado", sem um único item, e o painel não apontava
+    // nada — porque o front só mostra erro quando o HTTP não é 2xx.
+    //
+    // Um orçamento vazio é uma FALHA. Responder 200 pra isso é o pior tipo
+    // de bug: some com o problema em vez de mostrá-lo.
+    if (items.length === 0) {
+      const motivos: string[] = [];
+      if (descartadosSemMyBase.length > 0) {
+        motivos.push(
+          `${descartadosSemMyBase.length} composição(ões) própria(s) sem cadastro no MyBase ` +
+            '— o Passo 1 não rodou ou falhou. Rode o Passo 1 antes do Passo 2. ' +
+            `Itens: ${descartadosSemMyBase.slice(0, 5).join('; ')}` +
+            (descartadosSemMyBase.length > 5 ? ` e mais ${descartadosSemMyBase.length - 5}` : ''),
+        );
+      }
+      if (descartadosSemCodigo.length > 0) {
+        motivos.push(
+          `${descartadosSemCodigo.length} serviço(s) sem código utilizável na extração. ` +
+            `Itens: ${descartadosSemCodigo.slice(0, 5).join('; ')}` +
+            (descartadosSemCodigo.length > 5 ? ` e mais ${descartadosSemCodigo.length - 5}` : ''),
+        );
+      }
+      if (motivos.length === 0) {
+        motivos.push(
+          `A extração trouxe ${comps.length} linha(s), mas nenhuma era etapa (tipo_linha='grupo') ` +
+            "nem serviço (tipo_linha='servico'). Revise a extração do edital.",
+        );
+      }
+
+      const diagnostico = {
+        ...(((await admin.from('licitacoes').select('cadastro_resumo')
+          .eq('id', licitacaoId).maybeSingle()).data?.cadastro_resumo) as
+          Record<string, unknown> | null ?? {}),
+        budget_id,
+        budget_url: `https://app.orcafascio.com/orc/orcamentos/${budget_id}`,
+        orcamento_vazio: true,
+        etapas_criadas: 0,
+        composicoes_criadas: 0,
+        total_itens_batch: 0,
+        descartados_sem_mybase: descartadosSemMyBase,
+        descartados_sem_codigo: descartadosSemCodigo,
+        falhou_em: new Date().toISOString(),
+        warnings: [
+          ...warnings.map((w) => `[Passo 2 - Orçamento] ${w}`),
+          ...motivos.map((m) => `[Passo 2 - Orçamento] NENHUM ITEM CADASTRADO: ${m}`),
+        ],
+      };
+      // 'erro' é sempre um destino válido na máquina de estados, e sair dele
+      // também é — então o orçamentista consegue corrigir e tentar de novo.
+      await admin
+        .from('licitacoes')
+        .update({ status: 'erro', cadastro_resumo: diagnostico })
+        .eq('id', licitacaoId);
+
+      return errorResponse(
+        422,
+        `O orçamento foi criado no Orçafascio mas ficou VAZIO — nenhum item pôde ser cadastrado. ${motivos.join(' ')}`,
+        {
+          budget_id,
+          budget_url: `https://app.orcafascio.com/orc/orcamentos/${budget_id}`,
+          descartados_sem_mybase: descartadosSemMyBase,
+          descartados_sem_codigo: descartadosSemCodigo,
+          trace_id: traceId,
+        },
+      );
+    }
+
+    // Entrou alguma coisa, mas não tudo: avisa quais serviços ficaram de fora.
+    if (descartadosSemMyBase.length > 0) {
+      warnings.push(
+        `⚠ ${descartadosSemMyBase.length} composição(ões) própria(s) NÃO entraram no orçamento por não terem ` +
+          'cadastro no MyBase (Passo 1). Rode o Passo 1 e recadastre, ou adicione na mão: ' +
+          descartadosSemMyBase.join('; '),
+      );
+    }
+    if (descartadosSemCodigo.length > 0) {
+      warnings.push(
+        `⚠ ${descartadosSemCodigo.length} serviço(s) NÃO entraram no orçamento por não terem código ` +
+          'utilizável na extração: ' + descartadosSemCodigo.join('; '),
+      );
     }
 
     if (items.length > 0) {
