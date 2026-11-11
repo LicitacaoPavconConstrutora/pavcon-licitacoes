@@ -147,7 +147,10 @@ $v = RodarQuieto 'npx' @('--yes',$CLI,'--version')
 if ($v.Codigo -ne 0) {
     Morre "Nao consegui preparar a CLI do Supabase:`n$($v.Saida)"
 }
-Ok "CLI do Supabase $($v.Saida.Trim())."
+# So o numero: no PowerShell 5.1 a saida capturada traz junto o aviso de
+# "nova versao disponivel" da CLI, formatado como se fosse erro.
+$versaoCli = [regex]::Match($v.Saida, '\d+\.\d+\.\d+').Value
+Ok "CLI do Supabase $versaoCli."
 
 # -------------------------------------------------------------------------
 Passo 4 'Entrando na sua conta Supabase'
