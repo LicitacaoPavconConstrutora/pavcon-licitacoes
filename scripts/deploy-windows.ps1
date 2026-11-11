@@ -10,6 +10,13 @@
     recusa qualquer outro projeto. Isso e proposital: a mesma conta Supabase
     hospeda outros projetos e nenhum deles pode ser tocado por este script.
 
+    Nota sobre PowerShell 5.1: programas externos (git, npm, supabase)
+    escrevem avisos no stderr o tempo todo. Com ErrorActionPreference='Stop'
+    e saida redirecionada, o PowerShell transforma esses avisos em erro
+    fatal e mata o script no meio. Por isso aqui a preferencia fica em
+    'Continue' e cada chamada e conferida pelo codigo de saida, que e o
+    unico sinal confiavel de sucesso ou falha.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\scripts\deploy-windows.ps1
 
@@ -32,18 +39,43 @@ param(
     [switch] $SemAtualizar
 )
 
-$ErrorActionPreference = 'Stop'
+# Ver a nota sobre PowerShell 5.1 em .DESCRIPTION. Nao troque para 'Stop'.
+$ErrorActionPreference = 'Continue'
 
 # --- TRAVA DE SEGURANCA ---------------------------------------------------
 # Nao transforme isto em parametro. Ver o bloco .DESCRIPTION acima.
 $PROJECT_REF = 'cwgjjjlyccgivscngzgz'
 $REPO_URL    = 'https://github.com/LicitacaoPavconConstrutora/pavcon-licitacoes.git'
+$CLI         = 'supabase@2.98.2'
 # --------------------------------------------------------------------------
 
 function Escreve($texto, $cor = 'White') { Write-Host $texto -ForegroundColor $cor }
 function Passo($n, $texto) { Write-Host ''; Escreve ">> Passo $n - $texto" 'Cyan' }
 function Ok($texto)    { Escreve "   OK: $texto" 'Green' }
 function Aviso($texto) { Escreve "   ! $texto" 'Yellow' }
+
+function Morre($mensagem) {
+    Write-Host ''
+    Escreve '=========================================================' 'Red'
+    Escreve '  PAROU' 'Red'
+    Escreve '=========================================================' 'Red'
+    Escreve $mensagem 'Red'
+    exit 1
+}
+
+# Roda um programa externo mostrando a saida. Devolve o codigo de saida.
+function Rodar {
+    param([Parameter(Mandatory)][string] $Exe, [string[]] $Argumentos = @())
+    & $Exe @Argumentos
+    return $LASTEXITCODE
+}
+
+# Roda um programa externo engolindo a saida. Devolve codigo e texto.
+function RodarQuieto {
+    param([Parameter(Mandatory)][string] $Exe, [string[]] $Argumentos = @())
+    $texto = (& $Exe @Argumentos 2>&1 | Out-String)
+    return [pscustomobject]@{ Codigo = $LASTEXITCODE; Saida = $texto }
+}
 
 function Existe($comando) {
     $null -ne (Get-Command $comando -ErrorAction SilentlyContinue)
@@ -52,15 +84,15 @@ function Existe($comando) {
 function GarantePrograma($comando, $wingetId, $nomeAmigavel) {
     if (Existe $comando) { Ok "$nomeAmigavel ja instalado."; return }
     if (-not (Existe 'winget')) {
-        throw "$nomeAmigavel nao esta instalado e o winget nao existe nesta maquina. Instale $nomeAmigavel manualmente e rode o script de novo."
+        Morre "$nomeAmigavel nao esta instalado e o winget nao existe nesta maquina. Instale $nomeAmigavel manualmente e rode o script de novo."
     }
     Aviso "$nomeAmigavel nao encontrado. Instalando via winget..."
-    winget install --id $wingetId --silent --accept-package-agreements --accept-source-agreements
+    $c = Rodar 'winget' @('install','--id',$wingetId,'--silent','--accept-package-agreements','--accept-source-agreements')
     # O PATH so e relido pelo processo atual depois disto:
     $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path','User')
     if (-not (Existe $comando)) {
-        throw "$nomeAmigavel foi instalado mas ainda nao aparece no PATH. Feche e reabra o PowerShell como Administrador e rode o script de novo."
+        Morre "$nomeAmigavel foi instalado mas ainda nao aparece no PATH. Feche e reabra o PowerShell como Administrador e rode o script de novo."
     }
     Ok "$nomeAmigavel instalado."
 }
@@ -71,68 +103,95 @@ Escreve '  OrcaPav - deploy de Edge Functions' 'Magenta'
 Escreve "  Projeto Supabase: $PROJECT_REF" 'Magenta'
 Escreve '=========================================================' 'Magenta'
 
+# -------------------------------------------------------------------------
 Passo 1 'Conferindo Git e Node'
 GarantePrograma 'git'  'Git.Git'       'Git'
 GarantePrograma 'node' 'OpenJS.NodeJS' 'Node.js'
 
 $versaoNode = (node --version) -replace '^v',''
 if ([int]($versaoNode.Split('.')[0]) -lt 20) {
-    throw "Node $versaoNode e antigo demais. O projeto precisa da versao 20 ou maior."
+    Morre "Node $versaoNode e antigo demais. O projeto precisa da versao 20 ou maior."
 }
 Ok "Node $versaoNode."
 
+# -------------------------------------------------------------------------
 Passo 2 'Baixando o codigo'
 if (Test-Path (Join-Path $Pasta '.git')) {
     Set-Location $Pasta
     if ($SemAtualizar) {
         Aviso 'Pulando a atualizacao (-SemAtualizar).'
     } else {
-        $sujo = git status --porcelain
+        $sujo = (RodarQuieto 'git' @('status','--porcelain')).Saida.Trim()
         if ($sujo) {
-            throw "A pasta $Pasta tem alteracoes nao salvas. Resolva no Git antes, ou rode com -SemAtualizar para subir exatamente o que esta ai."
+            Morre "A pasta $Pasta tem alteracoes nao salvas:`n$sujo`n`nResolva no Git antes, ou rode com -SemAtualizar para subir exatamente o que esta ai."
         }
-        git fetch origin $Branch
-        git checkout $Branch
-        git reset --hard "origin/$Branch"
+        if ((Rodar 'git' @('fetch','origin',$Branch)) -ne 0) { Morre 'git fetch falhou. Confira sua conexao.' }
+        if ((Rodar 'git' @('checkout',$Branch))        -ne 0) { Morre "git checkout $Branch falhou." }
+        if ((Rodar 'git' @('reset','--hard',"origin/$Branch")) -ne 0) { Morre 'git reset falhou.' }
     }
 } else {
     Escreve "   Clonando em $Pasta ..."
-    git clone --branch $Branch $REPO_URL $Pasta
+    if ((Rodar 'git' @('clone','--branch',$Branch,$REPO_URL,$Pasta)) -ne 0) { Morre 'git clone falhou.' }
     Set-Location $Pasta
 }
-Ok "Codigo em $Pasta ($(git rev-parse --short HEAD))."
+$commit = (RodarQuieto 'git' @('rev-parse','--short','HEAD')).Saida.Trim()
+Ok "Codigo em $Pasta ($commit)."
 
-Passo 3 'Instalando as dependencias (a CLI do Supabase vem daqui)'
-npm install --no-audit --no-fund
-if ($LASTEXITCODE -ne 0) { throw 'npm install falhou.' }
-Ok 'Dependencias instaladas.'
+# -------------------------------------------------------------------------
+Passo 3 'Preparando a CLI do Supabase'
+# Usamos npx com a versao fixa. Assim nao dependemos do postinstall do npm,
+# que as versoes novas do npm bloqueiam por padrao (o aviso 'allow-scripts').
+$v = RodarQuieto 'npx' @('--yes',$CLI,'--version')
+if ($v.Codigo -ne 0) {
+    Morre "Nao consegui preparar a CLI do Supabase:`n$($v.Saida)"
+}
+Ok "CLI do Supabase $($v.Saida.Trim())."
 
+# -------------------------------------------------------------------------
 Passo 4 'Entrando na sua conta Supabase'
-# Se ja houver token salvo, este comando responde sem abrir nada.
-npx --yes supabase projects list *> $null
-if ($LASTEXITCODE -ne 0) {
-    Aviso 'Vai abrir o navegador para voce entrar na conta Supabase.'
-    Aviso 'Use a conta que e dona do projeto da LICITACAO, nao a de outro projeto.'
-    npx --yes supabase login
-    if ($LASTEXITCODE -ne 0) { throw 'Login no Supabase falhou.' }
+$jaLogado = $false
+if ($env:SUPABASE_ACCESS_TOKEN) {
+    Ok 'Usando o token da variavel SUPABASE_ACCESS_TOKEN.'
+    $jaLogado = $true
+} else {
+    # 'Access token not provided' aqui NAO e falha: e so a resposta de quem
+    # ainda nao fez login. Por isso conferimos o codigo de saida e seguimos.
+    $teste = RodarQuieto 'npx' @('--yes',$CLI,'projects','list')
+    if ($teste.Codigo -eq 0) { $jaLogado = $true }
+}
+
+if (-not $jaLogado) {
+    Aviso 'Voce ainda nao esta logado. Vai abrir o navegador.'
+    Aviso 'ENTRE COM A CONTA DONA DO PROJETO DA LICITACAO, nao a de outro projeto.'
+    if ((Rodar 'npx' @('--yes',$CLI,'login')) -ne 0) {
+        Morre 'O login no Supabase nao foi concluido. Rode o script de novo.'
+    }
 }
 Ok 'Autenticado.'
 
+# -------------------------------------------------------------------------
 Passo 5 'Conferindo que a conta enxerga o projeto certo'
-$listagem = npx --yes supabase projects list 2>&1 | Out-String
-if ($listagem -notmatch [regex]::Escape($PROJECT_REF)) {
+$lista = RodarQuieto 'npx' @('--yes',$CLI,'projects','list')
+if ($lista.Codigo -ne 0) {
+    Morre "Nao consegui listar os projetos da conta:`n$($lista.Saida)"
+}
+if ($lista.Saida -notmatch [regex]::Escape($PROJECT_REF)) {
     Escreve ''
-    Escreve $listagem 'DarkGray'
-    throw @"
+    Escreve $lista.Saida 'DarkGray'
+    Morre @"
 A conta Supabase em que voce entrou NAO tem o projeto $PROJECT_REF.
-Voce entrou na conta de outro projeto. Rode:
-    npx supabase logout
+Voce entrou na conta de outro projeto.
+
+Rode:
+    npx $CLI logout
+
 e depois este script de novo, escolhendo a conta certa.
 Nada foi alterado.
 "@
 }
 Ok "Projeto $PROJECT_REF visivel nesta conta."
 
+# -------------------------------------------------------------------------
 Passo 6 "Subindo $($Funcoes.Count) funcao(oes)"
 $falhas = @()
 foreach ($fn in $Funcoes) {
@@ -143,8 +202,8 @@ foreach ($fn in $Funcoes) {
         continue
     }
     Escreve "   Subindo $fn ..." 'White'
-    npx --yes supabase functions deploy $fn --project-ref $PROJECT_REF
-    if ($LASTEXITCODE -ne 0) {
+    $c = Rodar 'npx' @('--yes',$CLI,'functions','deploy',$fn,'--project-ref',$PROJECT_REF)
+    if ($c -ne 0) {
         $falhas += $fn
         Aviso "$fn - FALHOU."
     } else {
@@ -152,7 +211,7 @@ foreach ($fn in $Funcoes) {
     }
 }
 
-Escreve ''
+Write-Host ''
 if ($falhas.Count -gt 0) {
     Escreve '=========================================================' 'Red'
     Escreve '  Terminou COM FALHAS:' 'Red'
