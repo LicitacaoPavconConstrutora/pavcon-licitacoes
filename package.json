@@ -15,10 +15,12 @@
     "fn:deploy:sync-grupos": "supabase functions deploy orcafascio-sync-grupos",
     "fn:deploy:extracao": "supabase functions deploy extracao-edital",
     "fn:deploy:cadastrar": "supabase functions deploy orcafascio-cadastrar-edital",
-    "fn:deploy:all": "supabase functions deploy orcafascio-auth && supabase functions deploy orcafascio-web-auth && supabase functions deploy orcafascio-sync-grupos && supabase functions deploy extracao-edital && supabase functions deploy orcafascio-cadastrar-edital",
+    "fn:deploy:orcamento": "supabase functions deploy orcafascio-cadastrar-orcamento",
+    "fn:deploy:all": "supabase functions deploy orcafascio-auth && supabase functions deploy orcafascio-web-auth && supabase functions deploy orcafascio-sync-grupos && supabase functions deploy extracao-edital && supabase functions deploy orcafascio-cadastrar-edital && supabase functions deploy orcafascio-cadastrar-orcamento",
     "types:gen": "supabase gen types typescript --linked > supabase/types/database.ts",
     "link": "supabase link --project-ref cwgjjjlyccgivscngzgz",
-    "validate": "node scripts/validate.mjs"
+    "validate": "node scripts/validate.mjs",
+    "deploy:windows": "powershell -ExecutionPolicy Bypass -File ./scripts/deploy-windows.ps1"
   },
   "engines": {
     "node": ">=20"
