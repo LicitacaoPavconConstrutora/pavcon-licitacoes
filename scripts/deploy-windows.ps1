@@ -63,12 +63,10 @@ function Morre($mensagem) {
     exit 1
 }
 
-# Roda um programa externo mostrando a saida. Devolve o codigo de saida.
-function Rodar {
-    param([Parameter(Mandatory)][string] $Exe, [string[]] $Argumentos = @())
-    & $Exe @Argumentos
-    return $LASTEXITCODE
-}
+# ATENCAO: nao embrulhe em funcao as chamadas que mostram saida na tela.
+# Em PowerShell, 'return $LASTEXITCODE' devolve TUDO que a funcao escreveu
+# mais o codigo, ou seja, um array; e array comparado com 0 da verdadeiro.
+# Por isso git/npx sao chamados direto e conferidos por $LASTEXITCODE.
 
 # Roda um programa externo engolindo a saida. Devolve codigo e texto.
 function RodarQuieto {
@@ -87,7 +85,7 @@ function GarantePrograma($comando, $wingetId, $nomeAmigavel) {
         Morre "$nomeAmigavel nao esta instalado e o winget nao existe nesta maquina. Instale $nomeAmigavel manualmente e rode o script de novo."
     }
     Aviso "$nomeAmigavel nao encontrado. Instalando via winget..."
-    $c = Rodar 'winget' @('install','--id',$wingetId,'--silent','--accept-package-agreements','--accept-source-agreements')
+    winget install --id $wingetId --silent --accept-package-agreements --accept-source-agreements
     # O PATH so e relido pelo processo atual depois disto:
     $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path','User')
@@ -125,13 +123,17 @@ if (Test-Path (Join-Path $Pasta '.git')) {
         if ($sujo) {
             Morre "A pasta $Pasta tem alteracoes nao salvas:`n$sujo`n`nResolva no Git antes, ou rode com -SemAtualizar para subir exatamente o que esta ai."
         }
-        if ((Rodar 'git' @('fetch','origin',$Branch)) -ne 0) { Morre 'git fetch falhou. Confira sua conexao.' }
-        if ((Rodar 'git' @('checkout',$Branch))        -ne 0) { Morre "git checkout $Branch falhou." }
-        if ((Rodar 'git' @('reset','--hard',"origin/$Branch")) -ne 0) { Morre 'git reset falhou.' }
+        git fetch origin $Branch
+        if ($LASTEXITCODE -ne 0) { Morre 'git fetch falhou. Confira sua conexao.' }
+        git checkout $Branch
+        if ($LASTEXITCODE -ne 0) { Morre "git checkout $Branch falhou." }
+        git reset --hard "origin/$Branch"
+        if ($LASTEXITCODE -ne 0) { Morre 'git reset falhou.' }
     }
 } else {
     Escreve "   Clonando em $Pasta ..."
-    if ((Rodar 'git' @('clone','--branch',$Branch,$REPO_URL,$Pasta)) -ne 0) { Morre 'git clone falhou.' }
+    git clone --branch $Branch $REPO_URL $Pasta
+    if ($LASTEXITCODE -ne 0) { Morre 'git clone falhou.' }
     Set-Location $Pasta
 }
 $commit = (RodarQuieto 'git' @('rev-parse','--short','HEAD')).Saida.Trim()
@@ -163,7 +165,8 @@ if ($env:SUPABASE_ACCESS_TOKEN) {
 if (-not $jaLogado) {
     Aviso 'Voce ainda nao esta logado. Vai abrir o navegador.'
     Aviso 'ENTRE COM A CONTA DONA DO PROJETO DA LICITACAO, nao a de outro projeto.'
-    if ((Rodar 'npx' @('--yes',$CLI,'login')) -ne 0) {
+    npx --yes $CLI login
+    if ($LASTEXITCODE -ne 0) {
         Morre 'O login no Supabase nao foi concluido. Rode o script de novo.'
     }
 }
@@ -195,15 +198,15 @@ Ok "Projeto $PROJECT_REF visivel nesta conta."
 Passo 6 "Subindo $($Funcoes.Count) funcao(oes)"
 $falhas = @()
 foreach ($fn in $Funcoes) {
-    $caminho = Join-Path $Pasta "supabase\functions\$fn\index.ts"
+    $caminho = [IO.Path]::Combine($Pasta, 'supabase', 'functions', $fn, 'index.ts')
     if (-not (Test-Path $caminho)) {
         $falhas += "$fn (pasta nao existe no repositorio)"
         Aviso "$fn - pulada, nao existe em supabase/functions."
         continue
     }
     Escreve "   Subindo $fn ..." 'White'
-    $c = Rodar 'npx' @('--yes',$CLI,'functions','deploy',$fn,'--project-ref',$PROJECT_REF)
-    if ($c -ne 0) {
+    npx --yes $CLI functions deploy $fn --project-ref $PROJECT_REF
+    if ($LASTEXITCODE -ne 0) {
         $falhas += $fn
         Aviso "$fn - FALHOU."
     } else {
